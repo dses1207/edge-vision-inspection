@@ -1,0 +1,10 @@
+name: ppe_check
+display_name: 示範：防護具違規
+model:
+  # 通常是線上的「第二個模型」（例如開放詞彙偵測器匯出成固定類別），以附加站掛在主站旁邊。
+  # 模型有哪些類別以 Registry 為準；站別只認 thresholds.violations 列的類別，runner 啟動時比對。
+  name: ppe
+  task: detect
+handler: edgevision_station_ppe_check:PpeCheckStation
+camera_params_required: []  # 選填 roi_regions、thresholds
+owner: ""

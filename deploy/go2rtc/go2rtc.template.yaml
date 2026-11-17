@@ -1,0 +1,72 @@
+# go2rtc — MVP 設定
+#
+# ⚠️ 這是【範本】。相機帳密以環境變數注入，不寫在設定檔裡。
+#
+# go2rtc 本身【不會】展開 ${VAR}（實測確認），因此由 entrypoint
+# 在啟動時用 envsubst 產生實際設定檔。這樣：
+#   ・範本可安全進版本庫
+#   ・實際帳密只存在於 .env 與運行中的容器記憶體
+#
+# 兩條串流：
+#   cam156        原始相機串流（passthrough，供推論服務解碼）
+#   cam156_marked 打了影格標記的重新編碼串流（供前端監看）
+#
+# 為何前端看的是 marked 而非原始串流：
+#   時間戳無法跨路徑配對（見 docs/findings/2026-08-28-sync-verification.md），
+#   改把 frame id 畫進畫面。前端讀標記才能與推論結果精確配對。
+
+api:
+  listen: ":1984"
+  # K8s：go2rtc 經 Ingress 掛在 https://<網域>/go2rtc 底下（瀏覽器走 wss，不會被當成混合內容擋掉）。
+  # compose 不設（空字串 = 根目錄）。叢集內呼叫 API 也要帶這個前綴（edgevision-config 的 GO2RTC_API）。
+  base_path: "${GO2RTC_BASE_PATH}"
+  origin: "*"
+
+rtsp:
+  listen: ":8554"
+
+webrtc:
+  listen: ":8555"
+  # ⚠️ 只讓前端拿到「主機在觀看端網段的內網 IP」，其餘一律濾掉。
+  #
+  # 原本用 stun:8555 讓 go2rtc 自己問公網 IP —— 在工廠內網是災難：
+  # 會丟出一堆連不通的候選位址（公網、VPN、IPv6），
+  # 前端 ICE 得逐一試到「超時」才 fallback 到內網那個，體感就是「卡」，
+  # 多台同時連時全部一起卡。
+  #
+  # 三管齊下徹底鎖乾淨（官方 webrtc filters 文件）：
+  #   ice_servers: []      移除預設 STUN → 不再產生公網 srflx candidate
+  #   filters.ips          只保留這個內網 IP → 濾掉 VPN 網段
+  #   filters.networks     只用 IPv4 → 濾掉 IPv6 candidate
+  # 結果：candidate 只剩內網 IP 的 udp4/tcp4，ICE 第一個就命中、秒連。
+  #
+  # WEBRTC_IP 由環境變數帶入（K8s 遷移時改 ConfigMap，程式不動）。
+  ice_servers: []
+  filters:
+    ips:
+      - ${WEBRTC_IP}
+    networks: [udp4, tcp4]
+
+log:
+  level: info
+
+# ⚠️ 相機清單【不寫在這裡】。
+#
+# go2rtc 的相機清單是 PostgreSQL cameras 表的投影，
+# 由 ai-infer/tools/gen_go2rtc_streams.py 從設定 API 產生成 streams.generated.yaml，
+# 再由 entrypoint.sh 接到這個檔案後面。
+#
+# 為什麼不寫死在範本裡：實際踩過 —— 範本裡只寫了 cam156，但 DB 裡那條線有好幾台，
+# runner 照 DB 去連 cam193 起的幾台，go2rtc 沒有那些串流，於是每 10 秒重試一次，
+# 無限重連（實測 attempts 累積到 410 次）而且【沒有任何錯誤訊息】指出原因。
+# 更糟的是 streams.generated.yaml 其實早就產好躺在那裡，只是 entrypoint 從沒讀它。
+#
+# 每台相機會產生三條：<id>（子碼流，推論用）、<id>_main（主碼流）、
+# <id>_marked（來源留空，runner 把燒好框的影像 PUBLISH 進來）。
+#
+# ⚠️ _marked 必須宣告且來源留空。官方文件：「資料可以推送到已存在的串流，
+#   包括那些來源為空的串流」——
+#     ・完全不定義 → go2rtc 拒收，推流端收到 broken pipe
+#     ・定義成從自己拉流 → 形成迴圈，同樣失敗
+#   兩種錯法都實測過。
+streams:

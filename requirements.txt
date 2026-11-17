@@ -1,0 +1,42 @@
+# 推論服務執行期相依
+#
+# 不含 ultralytics / torch —— 推論走 Triton，模型不在此映像內。
+av>=13.0
+numpy>=1.26
+opencv-python-headless>=4.10
+pydantic>=2.9
+fastapi>=0.115
+uvicorn[standard]>=0.32
+websockets>=13.0
+httpx>=0.27
+apprise>=1.9
+
+# 儲存層
+psycopg[binary,pool]>=3.2
+minio>=7.2
+redis>=5.0
+
+# 推論（Triton 客戶端；模型本身不在此映像內）
+tritonclient[http]>=2.50
+
+# 控制平面（第二階段）：Registry、資料集版本、拉起步驟容器、讀 YAML 設定
+clearml>=1.16
+lakefs>=0.8
+docker>=7.1
+kubernetes>=31.0          # control-api 在 K8s 上用 K8sRunner 建訓練 Job（JOB_RUNNER=k8s）
+pyyaml>=6.0
+
+# 身分驗證（接OAuth 授權伺服器，JWKS 離線驗簽）
+PyJWT[crypto]>=2.9
+
+# MCP server（讓 agent 操作訓練平台；本機 stdio 模式）
+mcp>=1.2
+
+# 控制 API 的檔案上傳（資料集 zip）
+python-multipart>=0.0.9
+onvif-zeep>=0.2.12        # PTZ：ONVIF 控制（edgevision/ptz）
+pytapo>=3.3               # PTZ：Tapo 本機 API 馬達校準
+
+# 偵測 / 判定資料契約（Detection / FrameResult …）：唯一來源是 ai-infer 的 libs/contracts，
+# 同一個 repo，用路徑安裝。runner 與 event-processor 必須用同一份（見 libs/contracts/detection.py）。
+./ai-infer/libs/contracts

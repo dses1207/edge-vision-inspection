@@ -1,0 +1,10 @@
+name: template
+display_name: 範本站（類別計數）
+model:
+  name: seg_alpha
+  task: segment
+handler: edgevision_station_template:TemplateStation
+camera_params_required:
+  - target_class        # 要數的類別名
+  - max_count           # 超過（≥）這個數就 NG
+owner: ""

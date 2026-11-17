@@ -1,0 +1,13 @@
+{
+  "width": 1000, "height": 500,
+  "camera_params": {"zone": [[0.5, 0.0], [1.0, 0.0], [1.0, 1.0], [0.5, 1.0]], "thresholds": {"persist_frames": 2}},
+  "frames": [
+    {"expect": "ok", "detections": [
+      {"class_id": 0, "class_name": "person", "confidence": 0.9, "bbox": {"x1": 100, "y1": 100, "x2": 200, "y2": 400}}]},
+    {"expect": "ok", "detections": [
+      {"class_id": 0, "class_name": "person", "confidence": 0.9, "bbox": {"x1": 600, "y1": 100, "x2": 700, "y2": 400}}]},
+    {"expect": "ng", "detections": [
+      {"class_id": 0, "class_name": "person", "confidence": 0.9, "bbox": {"x1": 650, "y1": 100, "x2": 750, "y2": 400}}]},
+    {"expect": "ok", "detections": []}
+  ]
+}

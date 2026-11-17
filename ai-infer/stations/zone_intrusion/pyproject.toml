@@ -1,0 +1,13 @@
+[project]
+name = "edgevision-station-zone-intrusion"
+version = "0.1.0"
+description = "示範站：指定類別進入禁區、連續 N 幀 → NG，之後冷卻 M 秒。"
+requires-python = ">=3.10"
+dependencies = ["edgevision-contracts", "edgevision-rules", "edgevision-station-sdk"]
+
+[project.entry-points."edgevision.stations"]
+zone_intrusion = "edgevision_station_zone_intrusion:ZoneIntrusionStation"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13"]
+build-backend = "uv_build"

@@ -1,0 +1,25 @@
+# 告警回流（edgevision/media/alerts.py）的預設值。唯一放預設數字的地方；API 的查詢參數可以逐次覆蓋。
+
+queue:
+  per_station: 20            # 待判清單：每站每天抽幾個事件（同一天重複查，抽到的是同一批）
+
+feedback:
+  lookback_days: 7           # 每次回流看最近幾天判過的告警（證據影片保留 7 天，超過就沒辦法精準對幀）
+  status:                    # 判定 → 放進圖片集的狀態（框都是當下線上模型的框）
+    true_positive: labeled   # 真異常：框直接當標好的
+    false_positive: labeled  # 誤報：一樣直接當標好的（人在待判時已看過框）；要改成進審核就設 auto
+  batch_name: "告警回流 {date}"
+  fallback_collection: "告警回流 {model}"   # 這個模型沒有進行中的標注專案時，放進這個圖片集（沒有就建）
+  schedule_note: "每天 06:30 由 CronJob alert-feedback 觸發（deploy/k8s/base/alert-feedback-cron.yaml）"
+
+align:
+  before_s: 15               # 在告警時間前後各取多少秒的 NAS 錄影來找那一幀
+  after_s: 10
+  lag_sample_every: 3        # 求「證據影片 ↔ NAS」時間差時，每幾幀證據影片取一張比對
+  lag_agree_s: 0.15          # 多少比例的取樣落在中位數 ±這個秒數內才算有把握
+  lag_min_agree: 0.6
+  max_ts_offset_s: 1.5       # 只在資料庫告警時間前後幾秒內挑（實測 siteb12：NAS 那一幀在資料庫時間前 0.1–0.2 秒）
+  box_min_score: 20          # 框線吻合度（框線處的畫面差異，扣掉該框在各幀的常態值）至少要這麼高，才算找到那一幀
+                             # 實測 siteb12 8 筆：對到的 32–57；證據影片沒拍到那一刻的 15
+  nas_max_gap_s: 0.25        # NAS 上最接近的那一幀差超過這個秒數 → 這段 NAS 有缺，不收
+  fallback: auto             # 對不準（沒證據影片 / 沒把握）時的處理：auto（放進去當預標，進審核）/ skip

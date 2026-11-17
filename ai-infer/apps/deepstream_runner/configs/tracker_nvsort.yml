@@ -1,0 +1,66 @@
+%YAML:1.0
+# NvSORT tracker —— 跳幀時把框補回來。
+#
+# 為什麼是 NvSORT（不是 IOU / NvDCF / NvDeepSORT）：
+#   官方五種 tracker 共用同一個 .so，靠這份 config 切換。
+#   · IOU        沒有 state estimator，跳幀時框會「凍住」到下次推論 → 跟自己快取沒兩樣
+#   · NvSORT     有 Kalman filter，跳幀時外推框的位置；官方原話 "computationally efficient
+#                since it does not involve any pixel data processing" → 不吃 GPU 推論資源，
+#                不跟 Triton 搶 ✅
+#   · NvDCF      跑 correlation filter，要處理像素；NvDeepSORT 還要跑 Re-ID 神經網路 → 太貴
+#
+# ⚠️ 這份是從官方 config_tracker_NvSORT.yml 改的，只動了三處（都標了 ★），
+#    其餘數值是 NVIDIA 調過的，不要憑感覺改。
+#    官方原檔：/opt/nvidia/deepstream/deepstream-7.1/samples/configs/deepstream-app/config_tracker_NvSORT.yml
+
+BaseConfig:
+  # ★ 改動 1：0.1345 → 0.05
+  # 我們的框在 probe 裡就已經用 conf 門檻濾過了（見 postprocess），
+  # 這裡再濾一次只會把已經確定要畫的框吃掉。設低讓 tracker 全收。
+  minDetectorConfidence: 0.05
+
+TargetManagement:
+  enableBboxUnClipping: 0
+  maxTargetsPerStream: 300
+
+  # [Creation & Termination Policy]
+  minIouDiff4NewTarget: 0.5780
+  minTrackerConfidence: 0.8216
+  # ★ 改動 2：5 → 1
+  # 新目標要熬過 probation 才會輸出到下游。跳幀時「幀」變稀疏，
+  # 5 幀可能橫跨好幾個推論週期 → 手伸進畫面要等半秒才出現框。
+  probationAge: 1
+  # ★ 改動 3：26 → 90
+  # shadow tracking 的壽命必須 ≥ 跳幀間隔，否則物件在兩次推論之間就被判定終止。
+  # 90 幀 @15fps = 6 秒，足以涵蓋任何合理的 interval。
+  maxShadowTrackingAge: 90
+  earlyTerminationAge: 1
+
+TrajectoryManagement:
+  useUniqueID: 0
+
+DataAssociator:
+  dataAssociatorType: 0
+  associationMatcherType: 1
+  checkClassMatch: 1
+
+  # [Association Metric: Thresholds for valid candidates]
+  minMatchingScore4Overall: 0.2543
+  minMatchingScore4SizeSimilarity: 0.4019
+  minMatchingScore4Iou: 0.2159
+  matchingScoreWeight4SizeSimilarity: 0.1365
+  matchingScoreWeight4Iou: 0.3836
+
+  # [Association Metric: Tentative detections]
+  tentativeDetectorConfidence: 0.2331
+  minMatchingScore4TentativeIou: 0.2867
+  usePrediction4Assoc: 1
+
+StateEstimator:
+  # 2 = REGULAR（完整 Kalman filter）。這就是跳幀時框會「移動」而不是「凍住」的原因。
+  stateEstimatorType: 2
+
+  # [Dynamics Modeling]
+  noiseWeightVar4Loc: 0.0301
+  noiseWeightVar4Vel: 0.0017
+  useAspectRatio: 1

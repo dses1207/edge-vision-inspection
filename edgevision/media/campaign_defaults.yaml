@@ -1,0 +1,45 @@
+# 標注專案（照配方一輪一輪訓練）的全域預設值
+#
+# ⭐ 唯一放預設數字的地方；程式只定義欄位與範圍（edgevision/media/campaign.py），少了欄位一讀就報錯。
+# ⭐ 專案只把要覆蓋的欄位存進 media_campaigns.config（PATCH /api/media/campaigns/{id}）。
+
+reconcile_s: 30              # 調和迴圈幾秒看一次
+
+dataset:
+  repo: ""                   # LakeFS repo 前綴；空 = campaign-<專案 id>（批次快照 <前綴>-batch-<批次>、訓練快照 <前綴>-train）
+  val_pct: 20                # 批次快照的驗證集比例（依圖的 sha256 決定，同一張圖永遠在同一邊）
+  task: null                 # 標注輸出格式＝訓練 task（detect / segment / pose）；null = 建專案時從初始模型帶，帶不到 = detect
+
+prelabel:
+  conf: 0.10                 # 預標的信心門檻：低一點讓審核看得到候選框（同審核設定的 show_conf 預設）
+
+# 每一代訓練的設定範本（送 submit_training 的 config.train / export）
+train:
+  epochs: 150
+  imgsz: 1024
+  batch: 8
+  patience: 50
+  seed: 0
+  deterministic: true
+  workers: 4
+  device: 0
+  optimizer: auto
+  close_mosaic: 10
+  fliplr: 0.5
+  translate: 0.1
+  scale: 0.5
+
+export:
+  imgsz: 1024
+  dynamic: true
+  batch: 8
+  opset: 12
+  fp16: false
+  end2end: true              # 實際依權重自動判斷（pipeline 匯出前會用 is_end2end 覆寫）
+  max_det: 300
+
+# 每一代的 Gate：寬鬆，只為了讓模型進 Registry 給預標用；上線門檻另外判斷（release_criteria，之後定）
+iteration_gates:
+  absolute:
+    map50_box: 0.2
+  latency_ms_max: 1000

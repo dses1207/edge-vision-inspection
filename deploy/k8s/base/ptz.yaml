@@ -1,0 +1,41 @@
+# PTZ：手動控制、preset、歸位點、失準偵測 + 自動回正。
+# 相機 = cameras 表，帳密走 cred_ref（CAM_<REF>_USER / CAM_USER，來自 edgevision-secrets）。
+# Tapo 原生馬達校準要 TP-Link 雲端帳密：Secret ptz-tapo（TAPO_USERNAME / TAPO_PASSWORD / TAPO_CLOUD_PASSWORD），
+# 手動建、不進 git；沒建的話只有「校準馬達」這一個功能不能用，其他照常。
+#   kubectl -n edgevision create secret generic ptz-tapo --from-literal=TAPO_USERNAME=… --from-literal=TAPO_PASSWORD=… \
+#       --from-literal=TAPO_CLOUD_PASSWORD=…
+# ⚠️ 單一副本：背景迴圈（定時歸位、失準偵測）跑兩份會互相打架（同一台相機被兩邊同時移動）。
+apiVersion: v1
+kind: Service
+metadata: {name: ptz}
+spec:
+  selector: {app: ptz}
+  ports: [{name: http, port: 8097, targetPort: 8097}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: ptz}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: ptz}}
+  template:
+    metadata: {labels: {app: ptz}}
+    spec:
+      containers:
+        - name: ptz
+          image: edgevision-service
+          command: ["python", "run_ptz.py"]
+          envFrom:
+            - {configMapRef: {name: edgevision-config}}
+            - {secretRef: {name: edgevision-secrets}}
+            - {secretRef: {name: ptz-tapo, optional: true}}
+          env:
+            - {name: PTZ_PORT, value: "8097"}
+            # 抓畫面向 go2rtc 要截圖（不另開 RTSP 擠相機連線）；go2rtc 掛在 /go2rtc 前綴下
+            - {name: GO2RTC_API, value: "http://go2rtc:1984/go2rtc"}
+            - {name: TZ, value: Asia/Taipei}
+          ports: [{containerPort: 8097}]
+          readinessProbe: {httpGet: {path: /healthz, port: 8097}, periodSeconds: 15}
+          livenessProbe: {tcpSocket: {port: 8097}, initialDelaySeconds: 20, periodSeconds: 20}
+          resources: {requests: {cpu: 50m, memory: 128Mi}, limits: {memory: 1Gi}}

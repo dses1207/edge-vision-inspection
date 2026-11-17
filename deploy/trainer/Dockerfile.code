@@ -1,0 +1,27 @@
+# 訓練映像（edgevision-train）只換程式碼層 —— CI 每次建置都跑，標籤跟 edgevision-service 同一個 sha。
+#
+# 相依套件（torch / ultralytics / numpy 1.26 / opencv 4.8 釘版 / CLIP）沿用 TRAIN_BASE 那一版，
+# 只有改相依時才要用 deploy/trainer/Dockerfile 整個重建（在測試機建），
+# 建好後把 deploy/trainer/BASE_TAG 改成新標籤。
+#
+# 為什麼要進 CI：autolabel / 匯出 / 訓練都跑在這個映像裡。以前它不在 CI，部署沿用叢集上的舊版，
+# 2026-10-19 圖片集拿掉 task 欄位（DB 也刪了）後，舊映像的自動標注讀 col["task"] 直接 KeyError。
+ARG TRAIN_BASE
+FROM ${TRAIN_BASE}
+ARG GIT_COMMIT=unknown
+ENV CODE_COMMIT=${GIT_COMMIT}
+WORKDIR /app
+
+# 契約套件版號跟著主映像的 requirements.txt（--no-deps：不能動到基底釘住的 numpy / opencv）
+COPY ai-infer/libs/contracts /tmp/edgevision-contracts
+RUN pip install --no-deps /tmp/edgevision-contracts
+
+RUN rm -rf /app/edgevision /app/libs /app/configs /app/tools
+COPY edgevision/ ./edgevision/
+COPY libs/ ./libs/
+COPY configs/ ./configs/
+COPY tools/ ./tools/
+COPY pyproject.toml .
+# 閘門：跑在這個映像裡的任務入口都要 import 得起來
+RUN cp tools/trainer_entrypoint.sh /entrypoint.sh && chmod +x /entrypoint.sh \
+    && python -c "import edgevision.training.pipeline, edgevision.media.jobs, edgevision.media.autolabel, edgevision.media.export; print('code import gate ok')"

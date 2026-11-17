@@ -1,0 +1,18 @@
+# Triton 的 model repository：control-api 寫 config.pbtxt、Triton 載入 → 兩個 Pod 共用。
+# RWO 在單節點叢集可以被同節點多個 Pod 掛；日後多節點要改 RWX（Longhorn 支援）或讓 Triton 直接讀 MinIO。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: triton-models
+  labels: {recurring-job-group.longhorn.io/edgevision-daily: enabled}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 20Gi}}
+---
+# 訓練步驟之間共用的工作區（trainer → trtexec → parity → finalize），control-api 也掛。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: edgevision-train-work}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 100Gi}}

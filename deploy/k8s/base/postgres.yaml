@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: Service
+metadata: {name: postgres}
+spec:
+  selector: {app: postgres}
+  ports: [{name: pg, port: 5432, targetPort: 5432}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: postgres}
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector: {matchLabels: {app: postgres}}
+  template:
+    metadata: {labels: {app: postgres}}
+    spec:
+      containers:
+        - name: postgres
+          image: library/postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+          env:
+            - {name: POSTGRES_USER, valueFrom: {configMapKeyRef: {name: edgevision-config, key: POSTGRES_USER}}}
+            - {name: POSTGRES_DB, valueFrom: {configMapKeyRef: {name: edgevision-config, key: POSTGRES_DB}}}
+            - {name: POSTGRES_PASSWORD, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: POSTGRES_PASSWORD}}}
+            - {name: TZ, valueFrom: {configMapKeyRef: {name: edgevision-config, key: TZ}}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}   # Longhorn 卷根目錄有 lost+found
+          ports: [{containerPort: 5432}]
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d, readOnly: true}
+          readinessProbe:
+            exec: {command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]}
+            periodSeconds: 10
+          livenessProbe:
+            exec: {command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\""]}
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources: {requests: {cpu: 250m, memory: 512Mi}}
+      volumes:
+        - name: init
+          configMap: {name: postgres-init}     # deploy/postgres/init/*.sql（kustomization 產生）
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels: {recurring-job-group.longhorn.io/edgevision-db: enabled}   # 叢集設定：每 6h 快照、每天 02:00 備份
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: 20Gi}}

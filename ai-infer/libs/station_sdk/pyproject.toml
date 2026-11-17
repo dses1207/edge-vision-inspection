@@ -1,0 +1,10 @@
+[project]
+name = "edgevision-station-sdk"
+version = "0.1.0"
+description = "站別手冊的寫作規範與借閱櫃台：Station 介面、station.yaml 驗證、entry point 載入、fixture 回放。"
+requires-python = ">=3.10"
+dependencies = ["edgevision-contracts", "pydantic>=2.9", "pyyaml>=6.0"]
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13"]
+build-backend = "uv_build"

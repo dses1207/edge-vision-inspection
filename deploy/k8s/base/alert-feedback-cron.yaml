@@ -1,0 +1,26 @@
+# 告警回流：每天 06:30（台北）把判過的線上告警送進各模型標注專案的圖片集（edgevision/media/alerts.py）。
+# 只是呼叫控制 API（POST /api/media/alerts/feedback/run）；真正取 NAS 幀的是它建的匯入任務（K8s Job，掛 NAS）。
+# 放在存證保留（04:00 清 7 天前的影片連結）之後：回流只看最近 7 天，證據影片都還在。
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: alert-feedback}
+spec:
+  schedule: "30 6 * * *"
+  timeZone: Asia/Taipei
+  suspend: false
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: run
+              image: edgevision-service
+              command: ["python", "-m", "edgevision.media.alerts", "run"]
+              env: [{name: CONTROL_API, value: "http://control-api:8090"}]
+              resources: {requests: {cpu: 10m, memory: 64Mi}, limits: {memory: 256Mi}}

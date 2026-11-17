@@ -1,0 +1,8 @@
+# 推論站點：哪些線的推論跑在哪一台 GPU 節點（edgevision/orchestrator/sites.py）。
+# 基底 = 只有預設站點（全部線用 triton + inference-gpu）。多節點的叢集在 overlay 覆寫 sites.json。
+# 掛進 runner-reconciler（每輪重讀）與 control-api（promote 時同步到各站點的 Triton），改了不用重啟。
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: edgevision-inference-sites}
+data:
+  sites.json: "{}"

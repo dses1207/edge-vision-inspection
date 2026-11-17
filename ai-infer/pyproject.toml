@@ -1,0 +1,41 @@
+# ai-infer workspace 根
+#
+# 這不是一個套件，是「圖書館的總目錄」：列出成員、統一 lint/test 設定、釘住全 workspace 共用的相依上限。
+# 業務相依一律寫在各成員自己的 pyproject.toml，不寫這裡。
+[project]
+name = "ai-infer-workspace"
+version = "0.0.0"
+requires-python = ">=3.10"          # DeepStream 7.1 容器是 Python 3.10（pyds 1.2.0 cp310）；所有成員以此為下限
+dependencies = []
+
+[tool.uv]
+package = false                     # 根目錄只是容器，不建置、不安裝
+# DS 7.1 的 pyds 與 ultralytics 都要 numpy 1.x；一份 lockfile = 一個 numpy 版本，在根層釘住
+constraint-dependencies = ["numpy>=1.26,<2"]
+
+[tool.uv.workspace]
+members = ["libs/*", "stations/*", "apps/*"]
+
+[tool.uv.sources]
+edgevision-contracts = { workspace = true }
+edgevision-postprocess = { workspace = true }
+edgevision-rules = { workspace = true }
+edgevision-station-sdk = { workspace = true }
+edgevision-station-template = { workspace = true }
+edgevision-station-zone-intrusion = { workspace = true }
+edgevision-station-followup-window = { workspace = true }
+edgevision-station-ppe-check = { workspace = true }
+edgevision-deepstream-runner = { workspace = true }
+edgevision-cpu-runner = { workspace = true }
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ruff>=0.7"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["libs", "stations", "apps", "tests"]
+addopts = "--import-mode=importlib"   # 各站的 tests/test_station.py 同名，importlib 模式才不會撞
+markers = ["gpu: 需要 GPU / DeepStream 容器，CI 預設不跑"]

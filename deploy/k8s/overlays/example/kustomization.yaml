@@ -1,0 +1,33 @@
+# 範例 overlay：單節點叢集、叢集內 MinIO。複製成自己的環境後改「網域、映像、GPU 選擇器」三件事。
+#
+#   kubectl kustomize deploy/k8s/overlays/example          # 先看渲染結果
+#   EDGEVISION_TAG=<git sha> deploy/k8s/apply.sh example        # 套用（先檢查 Secret、映像存不存在）
+#
+# ⚠️ namespace 一定要寫在 overlay：base 的 namespace 只管 base 自己的資源，
+#    components 加進來的（minio…）沒寫就會落到 default，跟其他環境的同名 Ingress 撞在一起。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: edgevision
+resources:
+  - ../../base
+components:
+  - ../../components/minio-local        # 沒有既有的物件儲存時，用叢集內的 MinIO
+images:
+  - {name: edgevision-service, newName: ghcr.io/your-org/edgevision/edgevision-service, newTag: EDGEVISION_TAG}
+  - {name: tritonserver, newName: nvcr.io/nvidia/tritonserver, newTag: 25.08-py3}
+configMapGenerator:
+  - name: edgevision-config
+    behavior: merge
+    literals:
+      - WEBRTC_IP=192.0.2.10                     # 瀏覽器連得到的節點 IP（go2rtc WebRTC 只公告這個 candidate）
+      - GO2RTC_PUBLIC_URL=https://edgevision.example.com/go2rtc
+      - MCP_PUBLIC_URL=https://edgevision.example.com
+      - MINIO_PUBLIC_URL=https://edgevision-minio.example.com
+      - CORS_ORIGINS=https://edgevision-ui.example.com
+patches:
+  # GPU：用 DRA 的 CEL 選擇器挑卡（kubectl get resourceslices 看得到每張卡的屬性）
+  - target: {kind: ResourceClaim, name: inference-gpu}
+    patch: |-
+      - op: replace
+        path: /spec/devices/requests/0/exactly/selectors/0/cel/expression
+        value: "device.attributes['gpu.nvidia.com'].productName.lowerAscii().contains('rtx')"

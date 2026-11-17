@@ -1,0 +1,55 @@
+# runner 調和器：每 30 秒讓 runner（一條線一個 Deployment）跟資料庫的線路表一致。
+# 新線 → 建、停用 → 收、設定版本或映像變了 → 換（K8s 滾動重啟）。說明見 edgevision/orchestrator/runner_reconciler.py。
+#
+# runner 映像的唯一來源：ConfigMap edgevision-runner 的 image（預設）＋ image.<線路 id>（只給那條線）。它【不在】kustomize 裡（否則每次部署會蓋掉
+# ai-infer CI 寫進去的新版）—— 第一次由 deploy/ci/deploy_test.sh 建，之後由 runner 映像的 CI 更新。
+#
+# 也負責 go2rtc 的相機清單（edgevision/orchestrator/go2rtc_sync.py）：從相機表產生 → 寫 Secret go2rtc-streams
+# （有站點 go2rtc 的再寫 go2rtc-<站點>-streams）→ 清單變了就改 go2rtc Pod 範本的 streams-hash 換 Pod。
+# 相機帳密要用 CAM_* → envFrom edgevision-secrets。
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: runner-reconciler}
+imagePullSecrets: [{name: registry-pull}]   # 私有 registry 要 pull secret，見 registry.yaml
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: runner-reconciler}
+rules:
+  - {apiGroups: [apps], resources: [deployments], verbs: [get, list, watch, create, update, patch, delete]}
+  - {apiGroups: [""], resources: [secrets], resourceNames: [go2rtc-streams, go2rtc-siteb-streams], verbs: [get, patch]}
+  - {apiGroups: [""], resources: [configmaps], resourceNames: [edgevision-runner], verbs: [get]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: runner-reconciler}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: runner-reconciler}
+subjects: [{kind: ServiceAccount, name: runner-reconciler}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: runner-reconciler}
+spec:
+  replicas: 1                          # 只能一個：兩個同時調和會互相覆蓋
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: runner-reconciler}}
+  template:
+    metadata: {labels: {app: runner-reconciler}}
+    spec:
+      serviceAccountName: runner-reconciler
+      containers:
+        - name: reconciler
+          image: edgevision-service
+          command: ["python", "run_runner_reconciler.py"]
+          envFrom: [{secretRef: {name: edgevision-secrets}}]   # CAM_*：go2rtc 清單的相機帳密
+          env:
+            - {name: CONFIG_API, value: "http://output-api:18080"}
+            - {name: K8S_GPU_CLAIM, value: inference-gpu}
+            - {name: RECONCILE_INTERVAL, value: "30"}
+            - {name: NO_PROXY, value: "*"}
+            - {name: no_proxy, value: "*"}
+          resources: {requests: {cpu: 10m, memory: 64Mi}, limits: {memory: 256Mi}}
+          volumeMounts:
+            - {name: sites, mountPath: /etc/edgevision/sites, readOnly: true}   # 哪些線跑在哪個 GPU 節點（每輪重讀）
+      volumes:
+        - {name: sites, configMap: {name: edgevision-inference-sites}}

@@ -1,0 +1,13 @@
+[project]
+name = "edgevision-station-ppe-check"
+version = "0.1.0"
+description = "示範站：防護具違規（第二模型的偵測 + 滑動視窗確認 + 依原因冷卻）。示範一條線掛主站 + 附加站。"
+requires-python = ">=3.10"
+dependencies = ["edgevision-contracts", "edgevision-rules", "edgevision-station-sdk"]
+
+[project.entry-points."edgevision.stations"]
+ppe_check = "edgevision_station_ppe_check:PpeCheckStation"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13"]
+build-backend = "uv_build"

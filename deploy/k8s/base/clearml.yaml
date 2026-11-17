@@ -1,0 +1,232 @@
+# ClearML server：訓練實驗與模型註冊。設定同 compose（deploy/docker-compose.yml 的 clearml-*）。
+# webserver 的內建 nginx 用 apiserver / fileserver 這兩個名稱找後端（compose 是 network alias）→ 另建同名 Service。
+apiVersion: v1
+kind: Service
+metadata: {name: clearml-mongo}
+spec: {selector: {app: clearml-mongo}, ports: [{port: 27017, targetPort: 27017}]}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: clearml-mongo}
+spec:
+  serviceName: clearml-mongo
+  replicas: 1
+  selector: {matchLabels: {app: clearml-mongo}}
+  template:
+    metadata: {labels: {app: clearml-mongo}}
+    spec:
+      priorityClassName: edgevision-training
+      containers:
+        - name: mongo
+          image: library/mongo:8.0.15@sha256:f4d54619262ae3bc6a0a8efbebcef970b87b8ad70697479a75ce308a6f400158
+          args: ["--setParameter", "internalQueryMaxBlockingSortMemoryUsageBytes=196100200"]
+          volumeMounts: [{name: data, mountPath: /data/db}]
+          readinessProbe: {exec: {command: ["mongosh", "--quiet", "--eval", "db.runCommand('ping').ok"]}, periodSeconds: 15, timeoutSeconds: 5}
+          resources: {requests: {cpu: 100m, memory: 512Mi}}
+  volumeClaimTemplates:
+    - metadata: {name: data, labels: {recurring-job-group.longhorn.io/edgevision-daily: enabled}}
+      spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 10Gi}}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: clearml-elastic}
+spec: {selector: {app: clearml-elastic}, ports: [{port: 9200, targetPort: 9200}]}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: clearml-elastic}
+spec:
+  serviceName: clearml-elastic
+  replicas: 1
+  selector: {matchLabels: {app: clearml-elastic}}
+  template:
+    metadata: {labels: {app: clearml-elastic}}
+    spec:
+      priorityClassName: edgevision-training
+      # ES 以 uid 1000 執行；Longhorn 新卷擁有者是 root → 不設 fsGroup 會「failed to obtain node locks」（docker volume 沒這問題）
+      securityContext: {fsGroup: 1000}
+      initContainers:
+        # Elasticsearch 要求主機 vm.max_map_count ≥ 262144（需要 privileged；叢集有 PSA 時這個 namespace 要放寬）
+        - name: sysctl
+          image: library/busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+          command: ["sh", "-c", "sysctl -w vm.max_map_count=262144"]
+          securityContext: {privileged: true}
+      containers:
+        - name: elastic
+          image: library/elasticsearch:8.19.9@sha256:dee84085936b5b5fc3a6d322ff7545c939f99269b2d94bf19ea4af968893bbc4
+          env:
+            # K8s 不能設 ulimit memlock → memory_lock 關掉（compose 版是開）
+            - {name: bootstrap.memory_lock, value: "false"}
+            - {name: cluster.name, value: clearml}
+            - {name: cluster.routing.allocation.node_initial_primaries_recoveries, value: "500"}
+            - {name: cluster.routing.allocation.disk.watermark.low, value: 500mb}
+            - {name: cluster.routing.allocation.disk.watermark.high, value: 500mb}
+            - {name: cluster.routing.allocation.disk.watermark.flood_stage, value: 500mb}
+            - {name: discovery.type, value: single-node}
+            - {name: http.compression_level, value: "7"}
+            - {name: node.name, value: clearml}
+            - {name: reindex.remote.whitelist, value: "'*.*'"}
+            - {name: xpack.security.enabled, value: "false"}
+            - {name: ES_JAVA_OPTS, value: "-Xms1g -Xmx1g"}
+          volumeMounts: [{name: data, mountPath: /usr/share/elasticsearch/data}]
+          readinessProbe: {httpGet: {path: /_cluster/health, port: 9200}, periodSeconds: 15, timeoutSeconds: 5}
+          resources: {requests: {cpu: 250m, memory: 2Gi}, limits: {memory: 3Gi}}
+  volumeClaimTemplates:
+    - metadata: {name: data, labels: {recurring-job-group.longhorn.io/edgevision-daily: enabled}}
+      spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 20Gi}}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: clearml-redis}
+spec: {selector: {app: clearml-redis}, ports: [{port: 6379, targetPort: 6379}]}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: clearml-redis}
+spec:
+  serviceName: clearml-redis
+  replicas: 1
+  selector: {matchLabels: {app: clearml-redis}}
+  template:
+    metadata: {labels: {app: clearml-redis}}
+    spec:
+      priorityClassName: edgevision-training
+      containers:
+        - name: redis
+          image: library/redis:8.2.3@sha256:0908d9af26bf9b985e984a40a5eb82eed229b07a3317eee6843832c3cc3a9619
+          volumeMounts: [{name: data, mountPath: /data}]
+          readinessProbe: {exec: {command: ["redis-cli", "ping"]}, periodSeconds: 10}
+          resources: {requests: {cpu: 50m, memory: 64Mi}}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 2Gi}}}
+---
+# apiserver 與 fileserver 共用檔案卷（上傳的 artifact）與設定卷：單節點 RWO 可同節點共掛
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: clearml-fileserver, labels: {recurring-job-group.longhorn.io/edgevision-daily: enabled}}
+spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 20Gi}}}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: clearml-config}
+spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 1Gi}}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: clearml-apiserver}
+spec: {selector: {app: clearml-apiserver}, ports: [{port: 8008, targetPort: 8008}]}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: apiserver}                 # webserver 內建 nginx 找的名稱
+spec: {selector: {app: clearml-apiserver}, ports: [{port: 8008, targetPort: 8008}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: clearml-apiserver}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: clearml-apiserver}}
+  template:
+    metadata: {labels: {app: clearml-apiserver}}
+    spec:
+      priorityClassName: edgevision-training
+      containers:
+        - name: apiserver
+          image: clearml/server@sha256:5ec4aed2e40c619da63198c22e765a00b4e3e5c06081a9c0a4ae237df66fb7bb
+          args: [apiserver]
+          env:
+            - {name: CLEARML_ELASTIC_SERVICE_HOST, value: clearml-elastic}
+            - {name: CLEARML_ELASTIC_SERVICE_PORT, value: "9200"}
+            - {name: CLEARML_MONGODB_SERVICE_HOST, value: clearml-mongo}
+            - {name: CLEARML_MONGODB_SERVICE_PORT, value: "27017"}
+            - {name: CLEARML_REDIS_SERVICE_HOST, value: clearml-redis}
+            - {name: CLEARML_REDIS_SERVICE_PORT, value: "6379"}
+            - {name: CLEARML_SERVER_DEPLOYMENT_TYPE, value: linux}
+            - {name: CLEARML__apiserver__pre_populate__enabled, value: "false"}
+            - {name: CLEARML__services__async_urls_delete__enabled, value: "false"}
+            - {name: CLEARML__secure__credentials__services_agent__user_key, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: CLEARML_API_ACCESS_KEY}}}
+            - {name: CLEARML__secure__credentials__services_agent__user_secret, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: CLEARML_API_SECRET_KEY}}}
+            - {name: CLEARML__secure__credentials__tests__user_key, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: CLEARML_API_ACCESS_KEY}}}
+            - {name: CLEARML__secure__credentials__tests__user_secret, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: CLEARML_API_SECRET_KEY}}}
+            - {name: NO_PROXY, value: "*"}
+            - {name: no_proxy, value: "*"}
+          ports: [{containerPort: 8008}]
+          volumeMounts:
+            - {name: logs, mountPath: /var/log/clearml}
+            - {name: config, mountPath: /opt/clearml/config}
+            - {name: files, mountPath: /mnt/fileserver}
+          readinessProbe: {httpGet: {path: /debug.ping, port: 8008}, periodSeconds: 15}
+          startupProbe: {httpGet: {path: /debug.ping, port: 8008}, periodSeconds: 10, failureThreshold: 30}
+          resources: {requests: {cpu: 100m, memory: 512Mi}}
+      volumes:
+        - {name: logs, emptyDir: {}}
+        - {name: config, persistentVolumeClaim: {claimName: clearml-config}}
+        - {name: files, persistentVolumeClaim: {claimName: clearml-fileserver}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: clearml-fileserver}
+spec: {selector: {app: clearml-fileserver}, ports: [{port: 8081, targetPort: 8081}]}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: fileserver}                # webserver 內建 nginx 找的名稱
+spec: {selector: {app: clearml-fileserver}, ports: [{port: 8081, targetPort: 8081}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: clearml-fileserver}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: clearml-fileserver}}
+  template:
+    metadata: {labels: {app: clearml-fileserver}}
+    spec:
+      priorityClassName: edgevision-training
+      containers:
+        - name: fileserver
+          image: clearml/server@sha256:5ec4aed2e40c619da63198c22e765a00b4e3e5c06081a9c0a4ae237df66fb7bb
+          args: [fileserver]
+          env:
+            - {name: CLEARML__fileserver__delete__allow_batch, value: "true"}
+            - {name: NO_PROXY, value: "*"}
+            - {name: no_proxy, value: "*"}
+          ports: [{containerPort: 8081}]
+          volumeMounts:
+            - {name: logs, mountPath: /var/log/clearml}
+            - {name: files, mountPath: /mnt/fileserver}
+            - {name: config, mountPath: /opt/clearml/config}
+          readinessProbe: {tcpSocket: {port: 8081}, periodSeconds: 15}
+          resources: {requests: {cpu: 50m, memory: 128Mi}}
+      volumes:
+        - {name: logs, emptyDir: {}}
+        - {name: files, persistentVolumeClaim: {claimName: clearml-fileserver}}
+        - {name: config, persistentVolumeClaim: {claimName: clearml-config}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: clearml-webserver}
+spec: {selector: {app: clearml-webserver}, ports: [{port: 80, targetPort: 80}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: clearml-webserver}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: clearml-webserver}}
+  template:
+    metadata: {labels: {app: clearml-webserver}}
+    spec:
+      priorityClassName: edgevision-training
+      containers:
+        - name: webserver
+          image: clearml/server@sha256:5ec4aed2e40c619da63198c22e765a00b4e3e5c06081a9c0a4ae237df66fb7bb
+          args: [webserver]
+          env: [{name: NO_PROXY, value: "*"}, {name: no_proxy, value: "*"}]
+          ports: [{containerPort: 80}]
+          readinessProbe: {tcpSocket: {port: 80}, periodSeconds: 15}
+          resources: {requests: {cpu: 50m, memory: 64Mi}}

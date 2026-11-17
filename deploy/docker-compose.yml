@@ -1,0 +1,947 @@
+# ============================================================
+# edgevision 本機開發環境
+#
+# 分階段啟動（profile）：
+#   階段 0  基礎建設    docker compose --profile infra up -d
+#   階段 1  部署推論    docker compose --profile deploy up -d
+#   階段 2  訓練基礎    docker compose --profile train-infra up -d   （ClearML + LakeFS）
+#   階段 2  控制平面    docker compose --profile control up -d       （控制 API + Orchestrator）
+#   階段 2  trainer 映像 docker compose --profile train build        （只建映像，由 Orchestrator 按需拉起）
+#   全部              docker compose --profile infra --profile deploy --profile train-infra --profile control up -d
+#
+# ⚠️ 移轉到 K8s 的約定（每一條都必須守住）：
+#   ① 服務間只用「服務名:port」溝通 —— 不用 localhost、不寫死 IP
+#   ② 所有設定從環境變數讀 —— Compose 用 env_file，K8s 用 ConfigMap
+#   ③ 狀態只存外部服務或 volume —— 容器本身可隨時拋棄
+#   ④ 健康檢查用 HTTP 端點 —— Compose healthcheck ↔ K8s livenessProbe
+# ============================================================
+
+name: edgevision
+
+# 走 bridge 網路的服務
+# ⚠️ 所有服務都必須設 logging 上限。慘痛教訓（2026-09-02）：
+# Triton 容器的 Docker json log 無上限狂寫，堆到 698G 把測試機磁碟撐爆、機器掛掉。
+# max-size 20m × max-file 5 = 每服務 log 最多 100MB，自動輪替，永不再爆。
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-common: &common
+  restart: unless-stopped
+  env_file: [.env]
+  networks: [edgevision]
+  logging: *logging
+
+# 不吃 .env 的服務（ClearML 伺服器：.env 裡的 CLEARML_API_* 是【客戶端】設定，
+# 漏進伺服器容器會讓它在啟動時拿 SDK 連自己、卡在 /auth.login 重試）
+# ⚠️ docker CLI 會把內網 proxy 注入每個容器，且 Go/Python/requests 都優先看【小寫】no_proxy。
+#    這些服務只連內部服務名（clearml-apiserver、minio、postgres…），一旦走 proxy 就收 502。
+#    實測踩過兩次：LakeFS 起不來、clearml-fileserver 卡在登入迴圈（還報成假的「權限不足」）。
+x-no-proxy: &no-proxy
+  NO_PROXY: "*"
+  no_proxy: "*"
+  HTTP_PROXY: ""
+  HTTPS_PROXY: ""
+  http_proxy: ""
+  https_proxy: ""
+
+x-plain: &plain
+  restart: unless-stopped
+  networks: [edgevision]
+  logging: *logging
+
+# 走 host 網路的服務（WebRTC 需要）
+# ⚠️ network_mode 與 networks 互斥，不能共用同一個錨點
+x-host: &host-common
+  restart: unless-stopped
+  env_file: [.env]
+  network_mode: host
+  logging: *logging
+
+x-proxy: &proxy
+  HTTP_PROXY: ${HTTP_PROXY:-}
+  HTTPS_PROXY: ${HTTPS_PROXY:-}
+  NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
+
+networks:
+  edgevision:
+    driver: bridge
+
+volumes:
+  minio-data:
+  postgres-data:
+  redis-data:
+  triton-models:      # Triton 的 model repository（K8s 上對應 PVC）
+  # ── 第二階段 ──
+  clearml-mongo:
+  clearml-elastic:
+  clearml-redis:
+  clearml-fileserver:
+  clearml-logs:
+  clearml-config:
+  train-work:         # 訓練步驟間共用的工作區（trainer → trtexec → finalize）；K8s 對應 PVC
+
+services:
+
+  # ══════════════════════════════════════════════════════
+  # 階段 0：基礎建設
+  # 涵蓋所有階段會用到的基礎服務，一次建好不再變動
+  # ══════════════════════════════════════════════════════
+
+  minio:
+    <<: *common
+    profiles: [infra]
+    image: minio/minio:latest
+    container_name: edgevision-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # 一次性任務：建立 bucket 結構。完成即退出。
+  # K8s 上對應 Job 或 initContainer。
+  minio-init:
+    <<: *common
+    profiles: [infra]
+    image: minio/mc:latest
+    container_name: edgevision-minio-init
+    restart: "no"
+    depends_on:
+      minio: {condition: service_healthy}
+    entrypoint: /bin/sh
+    command: /scripts/init-buckets.sh
+    environment:
+      # ⚠️ 必須清空 proxy：容器只連內部服務名（minio:9000），
+      # 若沿用主機的 proxy 設定會被轉去外網，收到 proxy 的錯誤頁面。
+      # 這是容器化環境常見的陷阱 —— 內部流量不該經過 proxy。
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      NO_PROXY: "*"
+      no_proxy: "*"
+    volumes:
+      - ./minio/init:/scripts:ro
+
+  postgres:
+    <<: *common
+    profiles: [infra]
+    image: postgres:16-alpine
+    container_name: edgevision-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # 未來 LakeFS / ClearML 需要各自的 database，
+      # init 腳本會一併建好
+      TZ: ${TZ}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── Redis（事件匯流排 / 通知）─────────────────────────
+  # 用途：probe 判定結果 → Redis Streams → 多個 consumer group
+  #   (前端推播、NG 寄信、DB/MinIO 落地) 各自獨立 ack、掛了可重播。
+  # 這顆只是「單機測試用」的本地實例；正式環境走 K8s 上獨立維護的
+  # Redis，程式不動、只改 REDIS_URL（見 .env 的 K8s 對應約定）。
+  redis:
+    <<: *common
+    profiles: [infra]
+    image: redis:7-alpine
+    container_name: edgevision-redis
+    # appendonly：事件持久化，broker 重啟不丟未消費訊息
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── autoheal（unhealthy → 自動重啟）────────────────────
+  # ⚠️ 為什麼需要這個：Compose 的 healthcheck 只會把容器「標記」成
+  # unhealthy，【不會重啟它】—— 這與 K8s 的 livenessProbe 有本質差異。
+  # 而正式路線用 NVDEC 硬解，NVIDIA 元件有已知的記憶體洩漏
+  # ，「洩漏到上限自動重啟」這條韌性設計
+  # 在 Compose 階段等於沒生效。長時間穩定性測試會半夜掛掉沒人救。
+  #
+  # 上 K8s 後這個容器就不需要了（livenessProbe + resources.limits 原生支援）。
+  # 只重啟標了 autoheal=true 的容器，避免誤殺基礎服務。
+  autoheal:
+    <<: *common
+    profiles: [infra]
+    image: willfarrell/autoheal:latest
+    container_name: edgevision-autoheal
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: 10           # 每 10 秒檢查一次
+      AUTOHEAL_START_PERIOD: 120      # 啟動後 2 分鐘才開始管，給服務暖機時間
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: 30
+    volumes:
+      # 需要 docker socket 才能重啟其他容器（唯一需要它的服務）
+      - /var/run/docker.sock:/var/run/docker.sock
+    # ⚠️ 看門狗自己也要有健康檢查。它靠 docker.sock 工作 —— sock 掛掉或權限被改，
+    #    它會安靜地什麼都不做，而其他服務的 healthcheck 失敗就再也沒人重啟。
+    #    映像自帶 curl，直接問 docker 的 _ping。
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--unix-socket", "/var/run/docker.sock", "http://localhost/_ping"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+
+  # ══════════════════════════════════════════════════════
+  # 階段 1：部署推論
+  # ══════════════════════════════════════════════════════
+
+  go2rtc:
+    <<: *host-common
+    profiles: [deploy]
+    image: alexxit/go2rtc:latest
+    container_name: edgevision-go2rtc
+    # go2rtc 支援設定檔中的 ${VAR} 展開，相機帳密由此注入
+    # ⚠️ host 網路：WebRTC 的 ICE 需要主機的真實網段，
+    # 走 bridge 會導致候選位址錯誤、連線失敗。
+    # K8s 上對應 hostNetwork: true。
+    volumes:
+      - ./go2rtc/go2rtc.template.yaml:/config/go2rtc.template.yaml:ro
+      # 相機清單：cameras 表的投影，由 gen_go2rtc_streams.py 產生。
+      # 含明碼帳密，不進 git（見 .gitignore）。缺這個檔 entrypoint 會拒絕啟動。
+      - ./go2rtc/streams.generated.yaml:/config/streams.generated.yaml:ro
+      - ./go2rtc/entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    healthcheck:
+      # ⚠️ 不要用 wget：它不吃 no_proxy，即使 no_proxy 含 localhost 仍會走 proxy
+      #    → HTTP/1.1 502 Proxy Error（實測；同容器 curl 回 200）。
+      test: ["CMD", "curl", "-fsS", "--noproxy", "*", "-o", "/dev/null", "http://localhost:1984/api/streams"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  triton:
+    profiles: [deploy]
+    # 正式機（Blackwell / driver 595）要 25.08：TRITON_IMAGE=nvcr.io/nvidia/tritonserver:25.08-py3
+    image: ${TRITON_IMAGE:-nvcr.io/nvidia/tritonserver:24.09-py3}
+    container_name: edgevision-triton
+    restart: unless-stopped
+    networks: [edgevision]
+    logging: *logging     # ⚠️ 這裡漏設就是 698G log 爆磁碟的元兇（2026-09-02）
+    command: >
+      tritonserver
+      --model-repository=/models
+      --model-control-mode=explicit
+      --allow-http=true
+      --allow-grpc=true
+      --log-verbose=0
+      ${TRITON_EXTRA_ARGS:-}
+    # TRITON_EXTRA_ARGS：需要時設 --load-model=* --exit-on-error=false —— 主機上有排程會定期重啟所有 compose 容器時，
+    # explicit 模式重啟後模型全卸，runner 就斷了；啟動時全載才能自己恢復。
+    # 小顯存的卡（16 GB）不能全載（repo 裡模型放不下），維持預設空白、手動 load。
+    volumes:
+      - triton-models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # 指定卡：index（"0"）或 UUID（MIG-xxxx）。共用主機時只用分到的那片 MIG。
+              device_ids: ["${TRITON_GPU:-0}"]
+              capabilities: [gpu]
+    # 主機埠可覆寫：主機 8000 被佔用時改這裡。容器內固定 8000~8002（compose 網路內用 triton:8000）。
+    ports:
+      - "${TRITON_HTTP_PORT:-8000}:8000"   # HTTP
+      - "${TRITON_GRPC_PORT:-8001}:8001"   # gRPC
+      - "${TRITON_METRICS_PORT:-8002}:8002"   # metrics
+    healthcheck:
+      # ⚠️ 原本用 /dev/tcp + `echo -e` 手刻 HTTP 請求，送出的換行是 LF；
+      #    HTTP 規格要求 CRLF，Triton 因此不回應 → 永遠 unhealthy（實測 exit=1）。
+      #    改用 curl，並明確帶 --noproxy：容器有注入 http_proxy，
+      #    連 localhost 也會被送去 proxy（go2rtc 的 wget 就踩到，回 502 Proxy Error）。
+      test: ["CMD", "curl", "-fsS", "--noproxy", "*", "-o", "/dev/null", "http://localhost:8000/v2/health/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    # 本機無 GPU：Triton 會以 CPU 模式啟動。
+    # GPU 機台上加回：
+    #   deploy:
+    #     resources:
+    #       reservations:
+    #         devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
+
+  inference:
+    <<: *host-common
+    profiles: [deploy]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args: *proxy
+    image: ${INFERENCE_IMAGE:-edgevision:mvp}
+    container_name: edgevision-inference
+    # ⭐ 讓 autoheal 監看：healthcheck 失敗會被自動重啟
+    # （只標推論服務；基礎服務不標，避免共用依賴抖動時被連鎖重啟）
+    labels:
+      autoheal: "true"
+    # host 網路：要連相機（內網）與 go2rtc（同樣走 host 網路）
+    depends_on:
+      go2rtc: {condition: service_started}
+    environment:
+      # ⚠️ host 網路下服務名無法解析（容器不在 bridge 網路上），
+      # 故全部改指 localhost —— 因為 postgres/minio 都有對主機開 port。
+      #
+      # K8s 上這些會回到服務名：hostNetwork 的 Pod 仍能透過
+      # ClusterIP Service 解析服務名，不像 Compose 的 host 模式
+      # 會完全脫離 bridge 網路。屆時只需改 ConfigMap，程式不動。
+      API_PORT: ${API_PORT}
+      TRITON_URL: localhost:${TRITON_HTTP_PORT:-8000}
+      MINIO_ENDPOINT: localhost:${MINIO_API_PORT:-9000}
+      POSTGRES_HOST: localhost
+      # DATABASE_URL 是完整連線字串，必須整條覆寫 ——
+      # 只改 POSTGRES_HOST 不會生效（曾漏掉，導致落地靜默停用）
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT:-5432}/${POSTGRES_DB}
+      GO2RTC_API: http://localhost:1984
+      GO2RTC_RTSP: rtsp://localhost:8554
+      # host 網路：redis 服務名不可解析，改指對主機開的 port
+      REDIS_URL: redis://localhost:${REDIS_PORT:-6379}/0
+      NO_PROXY: "*"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:${API_PORT}/healthz',timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+
+  # ── output-api（獨立的 API 服務）────────────────────────
+  # ⭐ 為什麼獨立於推論：DeepStream 正式路線下推論跑在 DS 容器裡，
+  # 那個容器不該扛 web server。抽出來後推論掛了不影響監看與設定管理。
+  #
+  # 與 inference 用同一份 app，差別只在狀態來源：
+  #   同進程(run_mvp) → register_service 注入的物件
+  #   獨立(本服務)     → DB 的 line_status（runner 回報）
+  #
+  # ⚠️ 與 inference 二擇一使用：Python 輕量路線用 inference（內含 API）；
+  #    DeepStream 路線用「DS 容器 + 本服務」。同時起會搶同一個 port。
+  output-api:
+    <<: *common
+    profiles: [api]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args: *proxy
+    image: ${INFERENCE_IMAGE:-edgevision:mvp}
+    container_name: edgevision-output-api
+    # 程式碼靠 bind mount 進來（同 event-processor）—— 改程式只要 rsync + restart
+    volumes:
+      - ${CODE_ROOT:-..}:/app
+    working_dir: /app
+    command: ["python", "run_api.py"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      minio: {condition: service_healthy}
+    environment:
+      API_PORT: ${API_PORT}
+      DATABASE_URL: ${DATABASE_URL}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      REDIS_URL: ${REDIS_URL}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # 給正式前端用（獨立部署時必填，見 .env.example）
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      GO2RTC_PUBLIC_URL: ${GO2RTC_PUBLIC_URL:-}
+    ports:
+      - "${API_PORT}:${API_PORT}"
+    labels:
+      autoheal: "true"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:${API_PORT}/healthz',timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # Event Processor：Redis edgevision:store → PostgreSQL。
+  #
+  # ⚠️ 沒有它，推論結果只會堆在 Redis 裡 ——
+  #    實際發生過：2026-09-03 之後 DB 六天沒新資料，Redis 積了 10 萬筆。
+  #
+  # 為什麼獨立於 output-api：落地卡住不該讓監看頁面掛掉，反之亦然。
+  # consumer group 天然支援多副本分攤，要擴展直接加 replicas（但 STORE_CONSUMER
+  # 必須各自不同，預設用主機名，K8s 上就是 Pod 名，天然唯一）。
+  event-processor:
+    <<: *common
+    profiles: [api]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args: *proxy
+    # ⚠️ 測試機上實際跑的是 edgevision:mvp —— output-api / control-api 也都是。
+    #    compose 這裡寫的 edgevision/inference:dev 在機台上【不存在】（建置時 apt 失敗過），
+    #    這是既存的不一致，改天要統一。這裡先跟現況對齊，否則 compose up 直接失敗。
+    image: ${INFERENCE_IMAGE:-edgevision:mvp}
+    container_name: edgevision-event-processor
+    # ⚠️ 程式碼靠 bind mount 進來，不在映像裡 —— 測試機上 output-api / control-api 也是這樣跑的
+    #    （改程式只要 rsync + restart，不用重建映像）。
+    #    正式環境應該把程式碼烤進映像，這裡是測試機的權宜做法。
+    volumes:
+      - ${CODE_ROOT:-..}:/app
+    working_dir: /app
+    command: ["python", "run_processor.py"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # sampled（預設）：NG 與低信心 100% 留、正常幀 0.5%。
+      # all：全寫 —— 8 路 15fps 約 300 列/秒 ≈ 一天 2600 萬列，確認 PG 撐得住再開。
+      STATS_INTERVAL_S: ${STATS_INTERVAL_S:-60}
+    # ⚠️ 必須覆寫映像預設的 healthcheck —— 那個打 :8080/healthz，
+    #    但這是背景消費者不是 web 服務，會永遠 unhealthy（實測踩過）。
+    #    這裡改成問「consumer group 還在不在」：連得上 Redis 且 group 存在就算健康。
+    #    不查積壓量 —— 積壓多可能只是流量大，不代表壞掉，那是告警的事不是健康檢查的事。
+    healthcheck:
+      # ⚠️ decode_responses=True 不可省：xinfo_groups 預設回 bytes（b'store'），跟字串比對永遠 False → 永遠 unhealthy（實測踩過）。
+      test: ["CMD", "python", "-c", "import os,sys,redis; r=redis.Redis.from_url(os.environ['REDIS_URL'],socket_timeout=3,decode_responses=True); sys.exit(0 if any(x['name']==os.environ.get('STORE_GROUP','store') for x in r.xinfo_groups(os.environ.get('REDIS_STREAM_STORE','edgevision:store'))) else 1)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 30s
+
+  # 錄影服務：預錄緩衝 + 事件片段。
+  #
+  # ⚠️ 沒有它，NG 發生時查得到紀錄但【看不到畫面】——
+  #    推論結果經 Redis 傳的只有座標（1.5 KB/筆），影像留在 runner 容器裡。
+  #
+  # 為什麼不讓 runner 存：runner 在 GPU 管線上，任何 I/O 都可能拖累推論
+  # （probe 是生死線），而且它是 ai-infer 的映像、分開部署。
+  # 錄影是獨立的失敗域：它掛了推論照跑，推論掛了它還在錄。
+  recorder:
+    # ⚠️ 必須用 host 網路：go2rtc 是 host 網路（WebRTC 需要），
+    #    compose 網路裡的容器解析不到它的服務名，ffmpeg 會一直
+    #    「Error opening input: Input/output error」然後無限重啟。
+    #    runner 也是同樣的理由用 host。
+    <<: *host-common
+    profiles: [api]
+    image: ${INFERENCE_IMAGE:-edgevision:mvp}
+    container_name: edgevision-recorder
+    volumes:
+      - ${CODE_ROOT:-..}:/app
+      # 預錄緩衝：8 路 × 30 段 × 10 秒 @720p ≈ 450 MB。
+      # K8s 上換成 emptyDir 或 PVC，程式只讀 PRE_RECORD_BUFFER_DIR。
+      - ${PRE_RECORD_HOST_DIR:-/var/lib/edgevision/prebuffer}:/prebuffer
+    working_dir: /app
+    command: ["python", "run_recorder.py"]
+    # ⚠️ mp4 是 moov-at-end，寫不完就是永遠打不開的檔。
+    #    docker 預設只給 10s，8 支同時收尾會不夠 → 被 SIGKILL 就前功盡棄。
+    stop_grace_period: 40s
+    depends_on:
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+    environment:
+      # host 網路 → 一律走 localhost，不能用 compose 的服務名
+      REDIS_URL: redis://localhost:${REDIS_PORT:-6379}/0
+      CONFIG_API: http://localhost:${API_PORT}
+      GO2RTC_RTSP: rtsp://localhost:8554
+      # ⚠️ recorder 是 host network：go2rtc 這個 DNS 名字解析不到。不明寫的話會從 .env 繼承
+      #    http://go2rtc:1984 → 探測 _marked 全部失敗 → 14 台全退回原始串流 → 存證影片沒有框。
+      GO2RTC_API: http://localhost:1984
+      # ⭐ 片段上傳後要把 clip_uri 寫回 detections，否則影片是孤兒檔案
+      #    （前端查到 NG 也播不到影片）。
+      # ⚠️ 同 GO2RTC_API：host network 解析不到 compose 的服務名 postgres，
+      #    .env 裡的 DATABASE_URL 用的是服務名，必須整條覆寫成 localhost。
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT:-5432}/${POSTGRES_DB}
+      PRE_RECORD_BUFFER_DIR: /prebuffer
+      # host 網路：.env 裡的 MINIO_ENDPOINT 是 compose 的服務名，這裡解析不到
+      MINIO_ENDPOINT: localhost:${MINIO_API_PORT:-9000}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      CLIP_PRE_SECONDS: ${CLIP_PRE_SECONDS:-8}
+      CLIP_POST_SECONDS: ${CLIP_POST_SECONDS:-5}
+      MIN_FREE_GB: ${MIN_FREE_GB:-20}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    healthcheck:
+      # 預錄有在寫東西就算健康 —— 緩衝目錄不能是空的
+      test: ["CMD", "sh", "-c", "find /prebuffer -name 'seg*.mp4' -mmin -2 | grep -q ."]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+
+  # ── nas-recorder（24h 連續錄影 → NAS）──────────────────
+  #
+  # ⚠️ 預設不啟動。`docker compose --profile nas up -d nas-recorder` 才會起。
+  #
+  # 為什麼跟 recorder 分開跑：這支掛 NAS。NAS 掛不上 / 寫滿 / SMB 卡死時，
+  # 不該把事件錄影一起拖下水 —— 那是 NG 存證，比 24h 原始影像重要。
+  #
+  nas-recorder:
+    # 同 recorder：go2rtc 是 host 網路，compose 網路解析不到它
+    <<: *host-common
+    profiles: [nas]
+    image: ${INFERENCE_IMAGE:-edgevision:mvp}
+    container_name: edgevision-nas-recorder
+    volumes:
+      - ${CODE_ROOT:-..}:/app
+      # ⚠️ NAS 必須在【容器啟動前】就掛好。
+      #    bind-mount 是啟動當下綁定的：先起容器後掛 NAS，容器看到的是
+      #    主機上那個空目錄，然後把 24 小時的錄影寫進主機硬碟，不會有任何錯誤。
+      #    程式啟動時會檢查 /out 是不是掛載點（REC_REQUIRE_MOUNT=1），不是就拒絕啟動。
+      - ${REC_NAS_MOUNT:-/mnt/nas}:/out
+    working_dir: /app
+    command: ["python", "run_nas_recorder.py"]
+    # ⚠️ 連續錄影的段落是 moov-at-end（刻意不用 +faststart，見 prebuffer.build_command）。
+    #    SIGTERM 之後要把當前段的 moov 寫完，8 支同時在 CIFS 上收尾，10s 不夠。
+    stop_grace_period: 40s
+    environment:
+      TZ: ${TZ:-Asia/Taipei}          # ⚠️ 檔名用本地時間，UTC 會慢 8 小時（踩過）
+      CONFIG_API: http://localhost:${API_PORT}
+      GO2RTC_RTSP: rtsp://localhost:8554
+      REC_OUT_DIR: /out
+      REC_PROFILE: ${REC_PROFILE:-720p_h264}
+      REC_SEGMENT_SECONDS: ${REC_SEGMENT_SECONDS:-600}
+      # 0 = 不刪，寫到滿（與舊系統一致）。
+      # 唯一的保護是 REC_MIN_FREE_GB —— 那不是清理，只是不讓 NAS 被寫到 100%
+      # （SMB 掛載寫滿會整個卡死，連帶拖垮其他用這個掛載點的東西）。
+      REC_RETENTION_DAYS: ${REC_RETENTION_DAYS:-0}
+      REC_MIN_FREE_GB: ${REC_MIN_FREE_GB:-20}
+      # ⚠️ 不要調低到 30s：上游斷線時 ffmpeg 自己約 27~30s 會退出，
+      #    門檻跟它賽跑會搶先砍掉行程，把乾淨重連變成沒有 moov 的壞檔。
+      REC_STALL_SECONDS: ${REC_STALL_SECONDS:-90}
+      REC_REQUIRE_MOUNT: ${REC_REQUIRE_MOUNT:-1}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    healthcheck:
+      # ⚠️ 健檢一定要做對或不做。
+      #    舊系統借用 inference image 跑 recorder，內建的 HEALTHCHECK 打不到
+      #    → autoheal 每 ~2 分鐘重啟一次 → 錄影每 2 分鐘缺 3~5 秒。
+      #    我們的 autoheal 是 AUTOHEAL_CONTAINER_LABEL=all，同樣會中招。
+      #    程式確認真的有寫入才更新本機存活檔，這裡只看那個檔（不掃 NAS，目錄大了會超時）。
+      test: ["CMD", "sh", "-c", "find /tmp/nas-recorder.alive -mmin -2 | grep -q ."]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
+  # ── notifier（日報 + 健康巡檢 → Teams）─────────────────
+  #
+  # 看門狗不能跟被看的東西住在一起：它讀 /healthz 判斷別人死活，
+  # 塞進 output-api 的話 API 掛了就沒人叫。所以是獨立行程。
+  # 通道走 Apprise（現在 Teams，之後加寄信只改 .env）。沒設 NOTIFY_* 就是乾跑，
+  # 整條鏈照跑、卡片印進 log —— 測試機不一定有頻道。
+  notifier:
+    <<: *host-common
+    profiles: [api]
+    # ⚠️ 要有 build 段：`docker compose build notifier` 才會真的重建。
+    #    只寫 image 的話 build 是 no-op、exit 0、映像不變 —— 加 apprise 那次就這樣踩過。
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args: *proxy
+    image: ${INFERENCE_IMAGE:-edgevision:mvp}
+    container_name: edgevision-notifier
+    volumes:
+      - ${CODE_ROOT:-..}:/app
+    working_dir: /app
+    command: ["python", "run_notifier.py"]
+    depends_on:
+      redis: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+    environment:
+      TZ: ${TZ:-Asia/Taipei}          # 日報 08:00 是本地時間
+      # host 網路 → 一律 localhost（跟 recorder 同一個坑）
+      REDIS_URL: redis://localhost:${REDIS_PORT:-6379}/0
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT:-5432}/${POSTGRES_DB}
+      OUTPUT_API: http://localhost:${API_PORT}
+      # ⚠️ 三組 Apprise URL 清單（分號隔開）。通道是設定不是程式：
+      #    Teams 用 workflows://（不是 msteams://，那是 2026-05 停用的舊 connector）
+      #    寄信用 mailto://user:pass@smtp?to=...   加通道只改這裡。
+      #    是 secret，放 .env 不要進 git。空 = 乾跑。
+      NOTIFY_DAILY: ${NOTIFY_DAILY:-}
+      NOTIFY_HEALTH: ${NOTIFY_HEALTH:-}
+      NOTIFY_NG: ${NOTIFY_NG:-}
+      NOTIFY_DAILY_AT: ${NOTIFY_DAILY_AT:-08:00}
+      HEALTH_INTERVAL_S: ${HEALTH_INTERVAL_S:-60}
+      HEALTH_COOLDOWN_S: ${HEALTH_COOLDOWN_S:-600}
+      HEALTH_REPEAT_S: ${HEALTH_REPEAT_S:-14400}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    healthcheck:
+      # 活著 = 它自己的心跳有在寫（第二層在 /healthz services[] 看 rounds 有沒有在長）
+      test: ["CMD", "python", "-c", "import os,psycopg,sys; c=psycopg.connect(os.environ['DATABASE_URL']); r=c.execute(\"SELECT now()-heartbeat_at < interval '90 seconds' FROM service_status WHERE service='notifier'\").fetchone(); sys.exit(0 if r and r[0] else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ══════════════════════════════════════════════════════
+  # 階段 2-A：訓練基礎設施（train-infra）
+  #   ClearML Server（官方 compose 移植：apiserver / webserver / fileserver
+  #   + mongo + elasticsearch + redis）與 LakeFS。
+  #   ⚠️ ClearML 沒有 PG 後端，只用這三個儲存；Redis 與事件匯流排那顆分開（爆炸半徑）。
+  #   ⚠️ 資源：ES + Mongo + apiserver 約 4～6G RAM，開發機放不下，跑在 GPU 測試機。
+  # ══════════════════════════════════════════════════════
+
+  clearml-mongo:
+    <<: *plain
+    profiles: [train-infra]
+    image: mongo:8.0.15
+    container_name: edgevision-clearml-mongo
+    environment:
+      <<: *no-proxy
+    command: --setParameter internalQueryMaxBlockingSortMemoryUsageBytes=196100200
+    volumes:
+      - clearml-mongo:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand('ping').ok"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  clearml-elastic:
+    <<: *plain
+    profiles: [train-infra]
+    image: elasticsearch:8.19.9
+    container_name: edgevision-clearml-elastic
+    # 主機需 vm.max_map_count >= 262144（測試機已是 1048576）
+    environment:
+      <<: *no-proxy
+      bootstrap.memory_lock: "true"
+      cluster.name: clearml
+      cluster.routing.allocation.node_initial_primaries_recoveries: "500"
+      cluster.routing.allocation.disk.watermark.low: 500mb
+      cluster.routing.allocation.disk.watermark.high: 500mb
+      cluster.routing.allocation.disk.watermark.flood_stage: 500mb
+      discovery.type: single-node
+      http.compression_level: "7"
+      node.name: clearml
+      reindex.remote.whitelist: "'*.*'"
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms${CLEARML_ES_HEAP:-1g} -Xmx${CLEARML_ES_HEAP:-1g}"
+    ulimits:
+      memlock: {soft: -1, hard: -1}
+      nofile: {soft: 65536, hard: 65536}
+    volumes:
+      - clearml-elastic:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  clearml-redis:
+    <<: *plain
+    profiles: [train-infra]
+    image: redis:8.2.3
+    container_name: edgevision-clearml-redis
+    environment:
+      <<: *no-proxy
+    volumes:
+      - clearml-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  clearml-apiserver:
+    <<: *plain
+    profiles: [train-infra]
+    image: clearml/server:${CLEARML_SERVER_VERSION:-latest}
+    container_name: edgevision-clearml-apiserver
+    command: [apiserver]
+    # webserver 的 nginx 以「apiserver」「fileserver」服務名轉發，故加別名
+    networks:
+      edgevision:
+        aliases: [apiserver]
+    depends_on:
+      clearml-mongo: {condition: service_healthy}
+      clearml-elastic: {condition: service_healthy}
+      clearml-redis: {condition: service_healthy}
+    environment:
+      <<: *no-proxy
+      CLEARML_ELASTIC_SERVICE_HOST: clearml-elastic
+      CLEARML_ELASTIC_SERVICE_PORT: 9200
+      CLEARML_MONGODB_SERVICE_HOST: clearml-mongo
+      CLEARML_MONGODB_SERVICE_PORT: 27017
+      CLEARML_REDIS_SERVICE_HOST: clearml-redis
+      CLEARML_REDIS_SERVICE_PORT: 6379
+      CLEARML_SERVER_DEPLOYMENT_TYPE: linux
+      CLEARML__apiserver__pre_populate__enabled: "false"
+      CLEARML__services__async_urls_delete__enabled: "false"
+      # ⭐ 固定服務憑證：SDK / 控制 API / trainer 用這組登入，免去 UI 手動建 key
+      #    （官方 compose 用同一機制給 agent-services 發憑證）
+      CLEARML__secure__credentials__services_agent__user_key: ${CLEARML_API_ACCESS_KEY}
+      CLEARML__secure__credentials__services_agent__user_secret: ${CLEARML_API_SECRET_KEY}
+      CLEARML__secure__credentials__tests__user_key: ${CLEARML_API_ACCESS_KEY}
+      CLEARML__secure__credentials__tests__user_secret: ${CLEARML_API_SECRET_KEY}
+      NO_PROXY: "*"
+      no_proxy: "*"
+    volumes:
+      - clearml-logs:/var/log/clearml
+      - clearml-config:/opt/clearml/config
+      - clearml-fileserver:/mnt/fileserver
+    ports:
+      - "${CLEARML_API_PORT:-8008}:8008"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8008/debug.ping || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+  clearml-fileserver:
+    <<: *plain
+    profiles: [train-infra]
+    image: clearml/server:${CLEARML_SERVER_VERSION:-latest}
+    container_name: edgevision-clearml-fileserver
+    command: [fileserver]
+    networks:
+      edgevision:
+        aliases: [fileserver]
+    environment:
+      <<: *no-proxy
+      CLEARML__fileserver__delete__allow_batch: "true"
+      NO_PROXY: "*"
+    volumes:
+      - clearml-logs:/var/log/clearml
+      - clearml-fileserver:/mnt/fileserver
+      - clearml-config:/opt/clearml/config
+    ports:
+      - "${CLEARML_FILES_PORT:-8081}:8081"
+
+  clearml-webserver:
+    <<: *plain
+    profiles: [train-infra]
+    image: clearml/server:${CLEARML_SERVER_VERSION:-latest}
+    container_name: edgevision-clearml-webserver
+    command: [webserver]
+    depends_on:
+      clearml-apiserver: {condition: service_healthy}
+    environment:
+      <<: *no-proxy
+      NO_PROXY: "*"
+    ports:
+      # 8080 已被 inference（host 網路）用掉，Web UI 走 8180
+      - "${CLEARML_WEB_PORT:-8180}:80"
+
+  lakefs:
+    <<: *plain
+    profiles: [train-infra]
+    image: treeverse/lakefs:${LAKEFS_VERSION:-latest}
+    container_name: edgevision-lakefs
+    command: [run]
+    # ⚠️ 不寫 depends_on postgres/minio：它們在 infra profile，跨 profile 的 depends_on 會讓
+    #    單獨 `--profile train-infra up` 失敗。restart: unless-stopped 會在 PG 就緒前自動重試。
+    environment:
+      LAKEFS_LISTEN_ADDRESS: 0.0.0.0:8000
+      # metadata → 既有 PG 的 lakefs database（01-databases.sql 已建）
+      LAKEFS_DATABASE_TYPE: postgres
+      LAKEFS_DATABASE_POSTGRES_CONNECTION_STRING: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/lakefs?sslmode=disable
+      LAKEFS_AUTH_ENCRYPT_SECRET_KEY: ${LAKEFS_ENCRYPT_SECRET}
+      # 實體檔案 → 既有 MinIO datasets/ bucket
+      LAKEFS_BLOCKSTORE_TYPE: s3
+      LAKEFS_BLOCKSTORE_S3_FORCE_PATH_STYLE: "true"
+      LAKEFS_BLOCKSTORE_S3_ENDPOINT: http://minio:9000
+      LAKEFS_BLOCKSTORE_S3_DISCOVER_BUCKET_REGION: "false"
+      LAKEFS_BLOCKSTORE_S3_REGION: us-east-1
+      LAKEFS_BLOCKSTORE_S3_CREDENTIALS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      LAKEFS_BLOCKSTORE_S3_CREDENTIALS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      # 初始 admin / access key 由 lakefs-init 透過 setup API 建立（見下）
+      LAKEFS_LOGGING_LEVEL: INFO
+      # ⚠️ docker CLI 會把內網 proxy 注入容器，且 Go 與 Python 都優先看【小寫】no_proxy。
+      #    只給大寫 NO_PROXY 沒用：LakeFS 啟動時連 minio 驗 blockstore 會被送去 proxy，
+      #    卡在逾時 → 永遠不 listen、healthcheck 一直 000。兩個都要給。
+      NO_PROXY: "*"
+      no_proxy: "*"
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    ports:
+      # 8000 已被 Triton 用掉，主機側走 8010
+      - "${LAKEFS_PORT:-8010}:8000"
+    # ⚠️ LakeFS 啟動要 ~100 秒（實測 2026-09-10）：blockstore 初始化後還有一段沒有 log 的
+    #    準備工作，期間 port 8000 不會開、healthcheck 一律 000。這是正常的，不要以為它壞了。
+    #    映像內沒有 curl/wget，所以 healthcheck 由外部做：GET :8010/api/v1/healthcheck → 204
+
+  # 一次性：LakeFS 初始化（建 admin 與固定 access key）。完成即退出，重跑無害。
+  # LakeFS 的 INSTALLATION_* 環境變數只在 `lakefs setup` 生效，`run` 模式要打 setup API。
+  # K8s 上對應 Job 或 initContainer（與 minio-init 同型）。
+  lakefs-init:
+    <<: *plain
+    profiles: [train-infra]
+    image: curlimages/curl:latest
+    container_name: edgevision-lakefs-init
+    restart: "no"
+    environment:
+      NO_PROXY: "*"
+      no_proxy: "*"
+      LAKEFS_ACCESS_KEY: ${LAKEFS_ACCESS_KEY}
+      LAKEFS_SECRET_KEY: ${LAKEFS_SECRET_KEY}
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        for i in $$(seq 1 60); do
+          state=$$(curl -s -m 5 http://lakefs:8000/api/v1/setup_lakefs) && break
+          sleep 3
+        done
+        echo "lakefs setup state: $$state"
+        if echo "$$state" | grep -q not_initialized; then
+          # -m 120：新庫第一次 setup 可能超過 30 秒（正式機實測：伺服器端成功了、curl 先放棄 → 誤報失敗）
+          code=$$(curl -s -m 120 -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' http://lakefs:8000/api/v1/setup_lakefs \
+            -d "{\"username\":\"admin\",\"key\":{\"access_key_id\":\"$$LAKEFS_ACCESS_KEY\",\"secret_access_key\":\"$$LAKEFS_SECRET_KEY\"}}")
+          case "$$code" in
+            200|201) echo "✅ LakeFS 已初始化（admin + 固定 access key）" ;;
+            409) echo "LakeFS 已初始化（前一次 setup 其實成功了），略過" ;;
+            *) echo "❌ LakeFS 初始化失敗（HTTP $$code）"; exit 1 ;;
+          esac
+        else
+          echo "LakeFS 已初始化，略過"
+        fi
+
+  # ══════════════════════════════════════════════════════
+  # 階段 2-B：控制平面（control）
+  #   控制 API + Job Orchestrator。訓練的唯一觸發入口（UI / MCP / curl 都打這裡）。
+  #   掛 docker.sock 以拉起步驟容器；K8s 上改用 ServiceAccount 建 Job（換 JobRunner）。
+  # ══════════════════════════════════════════════════════
+
+  control-api:
+    <<: *common
+    profiles: [control]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args: *proxy
+    image: edgevision:mvp
+    container_name: edgevision-control-api
+    command: ["python", "run_control.py"]
+    # 同 lakefs：不對 infra profile 的服務寫 depends_on，靠 restart 等待
+    environment:
+      # 容器內固定 8090；主機側對外埠由 CONTROL_PORT 決定
+      CONTROL_PORT: 8090
+      TRITON_URL: http://triton:8000
+      TRITON_MODEL_REPO: /models
+      TRAIN_WORK_DIR: /work
+      # 身分驗證（見 .env.example 的說明）
+      AUTH_ENABLED: ${AUTH_ENABLED:-false}
+      AUTH_SERVER: ${AUTH_SERVER:-https://auth.example.com}
+      AUTH_AUDIENCE: ${AUTH_AUDIENCE:-edgevision_api}
+      AUTH_ALLOW_HEADER_ACTOR: ${AUTH_ALLOW_HEADER_ACTOR:-true}
+      AUTH_VERIFY_TLS: ${AUTH_VERIFY_TLS:-false}
+      AUTH_JWKS_TTL_S: ${AUTH_JWKS_TTL_S:-3600}
+      # 除錯用：設 true 則失敗的步驟容器不刪，可進去看它拿到什麼環境
+      TRAIN_KEEP_FAILED_CONTAINERS: ${TRAIN_KEEP_FAILED_CONTAINERS:-}
+      # Orchestrator 拉起步驟容器用的映像與 volume 名（K8s 對應 Job 的 image 與 PVC）
+      TRAINER_IMAGE: ${TRAINER_IMAGE:-edgevision/trainer:dev}
+      # ⚠️ 空白 = 訓練容器拿【全部】GPU（orchestrator/runner.py）。共用主機一定要指定，
+      #    否則一跑訓練就搶到別的系統的卡。值同 TRITON_GPU：index 或 MIG UUID，逗號分隔。
+      TRAIN_GPU_IDS: ${TRAIN_GPU_IDS:-}
+      EDGEVISION_IMAGE: edgevision:mvp
+      TRITON_IMAGE: ${TRITON_IMAGE:-nvcr.io/nvidia/tritonserver:24.09-py3}
+      TRAIN_WORK_VOLUME: ${COMPOSE_PROJECT_NAME:-edgevision}_train-work
+      DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME:-edgevision}_edgevision
+      NO_PROXY: "*"
+      no_proxy: "*"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - triton-models:/models
+      - train-work:/work
+    ports:
+      - "${CONTROL_PORT:-8090}:8090"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8090/healthz',timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ══════════════════════════════════════════════════════
+  # 階段 2-B2：遠端 MCP server（control）
+  #   使用者只要一行 URL 就能用，不必 clone repo、不必裝 Python。
+  #   Claude Code 內建 OAuth：收到 401 → 讀 metadata → 開瀏覽器登入 → 自動續期。
+  #   ⚠️ 它是控制 API 的客戶端，走內部服務名呼叫；只有這個服務對外曝露。
+  # ══════════════════════════════════════════════════════
+
+  mcp-server:
+    <<: *common
+    profiles: [control]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args: *proxy
+    image: edgevision:mvp
+    container_name: edgevision-mcp
+    command: ["python", "-m", "edgevision.mcp.remote"]
+    environment:
+      # 控制 API 走內部服務名（K8s 上是同 namespace 的 Service）
+      CONTROL_URL: http://control-api:8090
+      # 對外位址：Claude Code 會拿這個當 resource identifier。
+      # ⚠️ 換機器或上 K8s 時改這裡（將來是 https://<ingress-host>）
+      MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:-http://localhost:8096}
+      MCP_PORT: 8096
+      AUTH_SERVER: ${AUTH_SERVER:-https://auth.example.com}
+      AUTH_AUDIENCE: ${AUTH_AUDIENCE:-edgevision_api}
+      AUTH_VERIFY_TLS: ${AUTH_VERIFY_TLS:-false}
+      AUTH_JWKS_TTL_S: ${AUTH_JWKS_TTL_S:-3600}
+      NO_PROXY: "*"
+      no_proxy: "*"
+    ports:
+      - "${MCP_PORT:-8096}:8096"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8096/.well-known/oauth-protected-resource',timeout=3).status==200 else 1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ══════════════════════════════════════════════════════
+  # 階段 2-C：trainer 映像（train）
+  #   只用來 build：docker compose --profile train build trainer
+  #   實際的訓練容器由 Orchestrator 按需拉起（一次性、帶 GPU），不是常駐服務。
+  #   K8s 上對應 Job，這裡就是那個 Job 的映像。
+  # ══════════════════════════════════════════════════════
+
+  trainer:
+    profiles: [train]
+    build:
+      context: ..
+      dockerfile: deploy/trainer/Dockerfile
+      args:
+        <<: *proxy
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        BASE_IMAGE: ${TRAINER_BASE_IMAGE:-nvcr.io/nvidia/pytorch:24.09-py3}
+        INSTALL_TORCH: ${TRAINER_INSTALL_TORCH:-0}
+        PIP_EXTRA: ${TRAINER_PIP_EXTRA:-}
+    image: ${TRAINER_IMAGE:-edgevision/trainer:dev}
+    container_name: edgevision-trainer-image
+    restart: "no"
+    logging: *logging
+    command: ["python", "-c", "import ultralytics, clearml, lakefs; print('trainer image ok', ultralytics.__version__)"]

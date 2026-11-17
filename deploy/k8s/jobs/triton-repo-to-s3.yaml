@@ -1,0 +1,51 @@
+# 一次性搬遷：Triton model repository 從 PVC（triton-models）原樣鏡像到 MinIO。
+#
+# 佈局：models/_triton/<GPU 架構>/<模型>/{config.pbtxt, <版本>/model.plan}
+#   TensorRT engine 綁 GPU 架構，不同卡各自一份前綴：Ada（如 RTX 4080）= sm89、Blackwell（如 RTX PRO 6000）= sm120。
+#   沿用 models bucket（同 build-engines 的 models/_onnx/）：不新增 bucket，minio-init 不用改。
+#
+# 順序：先跑這個 Job → 確認物件齊了 → 再套用讓 Triton 改讀 s3:// 的 overlay（否則 Triton 起來是空的）。
+#   kubectl -n edgevision delete job triton-repo-to-s3 --ignore-not-found
+#   sed "s/ARCH/sm89/" deploy/k8s/jobs/triton-repo-to-s3.yaml | kubectl apply -f -
+#   kubectl -n edgevision logs -f job/triton-repo-to-s3
+# 冪等：mc mirror --overwrite，重跑只會再覆蓋一次。PVC 不動（回退時改回 /models 即可）。
+apiVersion: batch/v1
+kind: Job
+metadata: {name: triton-repo-to-s3, namespace: edgevision}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata: {labels: {app: triton-repo-to-s3}}
+    spec:
+      restartPolicy: Never
+      # triton-models 是 RWO：只能跟正在掛它的 Triton 同節點（正式雙節點時被排到 gpu-node-2 → Multi-Attach，2026-10-13）
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: {matchLabels: {app: triton}}
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: mirror
+          image: ghcr.io/your-org/edgevision/minio-mc:RELEASE.2025-08-13T08-35-41Z   # minio 已不在 Docker Hub，轉推到自己的 project
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              MC="mc --config-dir /tmp/.mc"
+              $MC alias set m http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null
+              # lost+found 是檔案系統的，不是模型
+              $MC mirror --overwrite --exclude "lost+found/*" /models/ m/models/_triton/ARCH/
+              # mc 映像沒有 find / awk / diff：用 mc diff 比兩邊（只列差異：缺檔或大小不同）
+              d=$($MC diff /models/ m/models/_triton/ARCH/)
+              [ -z "$d" ] || { echo "❌ 兩邊不一致："; echo "$d"; exit 1; }
+              $MC du m/models/_triton/ARCH/
+              echo "✅ 兩邊一致"
+          env:
+            - {name: MINIO_ROOT_USER, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: MINIO_ROOT_USER}}}
+            - {name: MINIO_ROOT_PASSWORD, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: MINIO_ROOT_PASSWORD}}}
+            - {name: NO_PROXY, value: "*"}
+            - {name: no_proxy, value: "*"}
+          volumeMounts: [{name: models, mountPath: /models, readOnly: true}]
+      volumes:
+        - {name: models, persistentVolumeClaim: {claimName: triton-models}}

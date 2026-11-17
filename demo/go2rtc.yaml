@@ -1,0 +1,15 @@
+# demo 的 go2rtc：串流由 cpu-runner 推進來（RTSP publish），所以每條都是空來源。
+# 正式環境由 runner 調和器從相機表產生這份清單（原始串流拉相機、_marked 留空等 runner 推）。
+api:
+  listen: ":1984"
+  origin: "*"
+rtsp:
+  listen: ":8554"
+webrtc:
+  listen: ":8555"
+  candidates: [127.0.0.1:8555]
+streams:
+  cam-01:
+  cam-01_marked:
+  cam-02:
+  cam-02_marked:

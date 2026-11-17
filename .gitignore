@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# 模型與資料一律不進 git（權重走 Registry / MinIO，資料集走 lakeFS）
+*.pt
+*.onnx
+*.engine
+*.plan
+wheels/*
+!wheels/.keep
+
+# 本機設定與密鑰
+.env
+!.env.example
+demo/.env
+*.kubeconfig
+deploy/go2rtc/streams.generated.yaml

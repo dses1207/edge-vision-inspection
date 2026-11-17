@@ -1,0 +1,8 @@
+# 端到端聯通性測試用的 Gate：機制全開、門檻極低（合成資料 + 1 epoch 不追求準度）。
+# ⚠️ 只給 test_train.sh 用，正式模型一律用 configs/gates/<model>.yaml。
+absolute:
+  map50_box: 0.0
+critical_recall:
+  hand: 0.0
+latency_ms_max: null
+golden_no_new_miss: false

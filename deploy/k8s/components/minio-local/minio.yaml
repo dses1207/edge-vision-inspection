@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: Service
+metadata: {name: minio}
+spec:
+  selector: {app: minio}
+  ports:
+    - {name: api, port: 9000, targetPort: 9000}
+    - {name: console, port: 9001, targetPort: 9001}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: minio}
+spec:
+  serviceName: minio
+  replicas: 1
+  selector: {matchLabels: {app: minio}}
+  template:
+    metadata: {labels: {app: minio}}
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - {name: MINIO_ROOT_USER, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: MINIO_ROOT_USER}}}
+            - {name: MINIO_ROOT_PASSWORD, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: MINIO_ROOT_PASSWORD}}}
+          ports: [{containerPort: 9000}, {containerPort: 9001}]
+          volumeMounts: [{name: data, mountPath: /data}]
+          readinessProbe: {httpGet: {path: /minio/health/ready, port: 9000}, periodSeconds: 10}
+          livenessProbe: {httpGet: {path: /minio/health/live, port: 9000}, initialDelaySeconds: 20, periodSeconds: 20}
+          resources: {requests: {cpu: 100m, memory: 512Mi}}
+  # ⚠️ 這裡只管第一次建立；StatefulSet 的 volumeClaimTemplates 改了 apply 會被拒絕。
+  #    要加大直接 patch PVC data-minio-0（longhorn 可線上擴充）。存證影片量大的線一天就能吃掉幾十 GB，容量要依線路估。
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 100Gi}}}
+---
+# 建 7 個 bucket + 影片 90 天過期（同 compose 的 minio-init，腳本共用 deploy/minio/init/init-buckets.sh）
+apiVersion: batch/v1
+kind: Job
+metadata: {name: minio-init}
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: init
+          image: ghcr.io/your-org/edgevision/minio-mc:RELEASE.2025-08-13T08-35-41Z   # minio 已不在 Docker Hub，轉推到自己的 project
+          command: ["/bin/sh", "/scripts/init-buckets.sh"]
+          env:
+            - {name: MINIO_ROOT_USER, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: MINIO_ROOT_USER}}}
+            - {name: MINIO_ROOT_PASSWORD, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: MINIO_ROOT_PASSWORD}}}
+            - {name: NO_PROXY, value: "*"}
+            - {name: no_proxy, value: "*"}
+          volumeMounts: [{name: scripts, mountPath: /scripts}]
+      volumes: [{name: scripts, configMap: {name: minio-init}}]
+---
+# 對外入口：瀏覽器直接用 presigned URL 取影片（API 用 MINIO_PUBLIC_URL 簽名，見 edgevision/storage/objects.py）。
+# 只開 S3 API（9000），不開管理介面（9001）。網域由 overlay 換成該叢集的。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: minio}
+spec:
+  tls: [{hosts: [edgevision-minio.example.com]}]
+  rules:
+    - host: edgevision-minio.example.com
+      http:
+        paths:
+          - {path: /, pathType: Prefix, backend: {service: {name: minio, port: {number: 9000}}}}

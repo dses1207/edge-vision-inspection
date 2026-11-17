@@ -1,0 +1,14 @@
+# seg_alpha 評估 Gate
+#
+# 不過就 fail，模型不註冊、不上線。
+# MVP 先驗「機制」，正式門檻等黃金測試集擴充後再收緊。
+absolute:                # 絕對門檻（golden set 上量）
+  map50_box: 0.90
+  map50_seg: 0.85
+
+critical_recall:         # 關鍵類別 recall 不能漏（hand 漏了就判不到違規動作）
+  hand: 0.95
+
+latency_ms_max: 50       # val 時每張推論毫秒（PyTorch，GPU）；null = 不檢查
+
+golden_no_new_miss: true # golden set 上不得出現「現役有抓到、新模型漏掉」的圖（需有現役 golden 逐圖結果；沒有則略過）

@@ -1,0 +1,38 @@
+# wildlife_det：公開資料集 African Wildlife（4 類）偵測模型，用 YOLO26（NMS-free）
+# 用途：訓練鏈路的公開資料示範 / 測試。技術棧與正式工位完全相同，只是資料是公開的。
+model_name: wildlife_det
+task: detect
+base_model: yolo26n.pt            # 映像預載；換 yolo26s.pt 準度更高
+dataset: lakefs://wildlife/main   # 請求的 dataset_ref 覆蓋
+golden:  null
+class_names: [buffalo, elephant, rhino, zebra]
+
+train:
+  epochs: 30
+  imgsz: 640
+  batch: 16
+  patience: 10
+  seed: 0
+  deterministic: true
+  workers: 4
+  device: 0
+  optimizer: auto
+  lr0: 0.01
+  close_mosaic: 5
+
+export:
+  imgsz: 640
+  dynamic: true
+  batch: 32
+  opset: 12
+  fp16: false
+  end2end: true    # YOLO26：輸出 (max_det, 6)，Triton 後處理不做 NMS
+  max_det: 300
+
+gates: configs/gates/wildlife_det.yaml
+
+parity:
+  images: 8
+  iou_match: 0.8
+  min_match_ratio: 0.9
+  conf_tolerance: 0.05

@@ -1,0 +1,11 @@
+# 映像來源與 pull secret。
+#
+# 自己建的映像（edgevision-service / edgevision-train / edgevision-runner / edgevision-tritonserver）放私有 registry 時，
+# namespace 的 default ServiceAccount 要掛 pull secret（訓練 / 預標 Job、runner、大部分服務都用 default）。
+# secret 本身不進 git：部署流程登入 registry 後用 docker config 建 / 覆蓋：
+#   kubectl -n edgevision create secret docker-registry registry-pull --docker-server=<registry> ...
+# 公開 registry（例如 ghcr.io 的 public package）不需要，這份可以從 kustomization 拿掉。
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: default}
+imagePullSecrets: [{name: registry-pull}]

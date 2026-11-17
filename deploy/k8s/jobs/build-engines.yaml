@@ -1,0 +1,77 @@
+# 在這個叢集的推論卡上把 ONNX 建成 TensorRT engine 並部署上 Triton。engine 綁 GPU 型號與 TRT 版本 → 每個叢集各建一次。
+#
+# 輸入：MinIO models/_onnx/<Triton 模型名>/{model.onnx, manifest.json}（manifest 同 ai-infer tools/export_engine.py 的產出）
+# 流程：① mc 下載 → ② Triton 映像的 trtexec 建 plan（fp16、batch 1/opt/max 照 manifest）→ ③ deploy_engine.py
+#       （plan 上 MinIO models/<name>/v1、寫 config.pbtxt、Triton explicit load）
+#
+#   kubectl -n edgevision delete job build-engines --ignore-not-found
+#   sed -e "s/EDGEVISION_TAG/<tag>/" -e "s/ARCH/<sm120|sm89>/" deploy/k8s/jobs/build-engines.yaml | kubectl apply -f -
+#   ARCH = 該叢集推論卡的 GPU 架構（Blackwell = sm120、Ada = sm89），
+#   要跟 Triton 的 --model-repository（s3://minio:9000/models/_triton/ARCH）一致，2026-10-13 起兩叢集都直讀 MinIO。
+#   只建部分模型：改 env ONLY（空白 = 全部）
+apiVersion: batch/v1
+kind: Job
+metadata: {name: build-engines, namespace: edgevision}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata: {labels: {app: build-engines}}
+    spec:
+      restartPolicy: Never
+      priorityClassName: edgevision-training
+      runtimeClassName: nvidia
+      resourceClaims: [{name: gpu, resourceClaimName: inference-gpu}]
+      initContainers:
+        - name: fetch
+          image: ghcr.io/your-org/edgevision/minio-mc:RELEASE.2025-08-13T08-35-41Z   # minio 已不在 Docker Hub，轉推到自己的 project
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              mc --config-dir /tmp/.mc alias set m http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null
+              mc --config-dir /tmp/.mc cp -r m/models/_onnx/ /work/src/
+              ls -la /work/src/*/
+          env:
+            - {name: MINIO_ROOT_USER, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: MINIO_ROOT_USER}}}
+            - {name: MINIO_ROOT_PASSWORD, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: MINIO_ROOT_PASSWORD}}}
+            - {name: NO_PROXY, value: "*"}
+            - {name: no_proxy, value: "*"}
+          volumeMounts: [{name: work, mountPath: /work}]
+        - name: trtexec
+          image: ghcr.io/your-org/edgevision/edgevision-tritonserver:25.08-py3
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -u; fail=0
+              for d in /work/src/*/; do
+                m=$(basename "$d")
+                if [ -n "${ONLY:-}" ] && ! echo ",$ONLY," | grep -q ",$m,"; then continue; fi
+                s=$(python3 -c "import json;print(json.load(open('$d/manifest.json'))['imgsz'])")
+                b=$(python3 -c "import json;print(json.load(open('$d/manifest.json')).get('max_batch_size',4))")
+                o=$(python3 -c "import json;print(json.load(open('$d/manifest.json')).get('opt_batch',1))")
+                mkdir -p /work/engines/$m && cp $d/manifest.json /work/engines/$m/
+                t0=$(date +%s)
+                /usr/src/tensorrt/bin/trtexec --onnx=$d/model.onnx --saveEngine=/work/engines/$m/model.plan \
+                  --minShapes=images:1x3x${s}x${s} --optShapes=images:${o}x3x${s}x${s} --maxShapes=images:${b}x3x${s}x${s} \
+                  --memPoolSize=workspace:4096 --fp16 > /work/engines/$m/trtexec.log 2>&1 \
+                  && echo "✅ $m ${s}px batch≤$b $(( $(date +%s)-t0 ))s" \
+                  || { echo "❌ $m：$(tail -3 /work/engines/$m/trtexec.log)"; rm -rf /work/engines/$m; fail=1; }
+              done
+              exit $fail
+          env: [{name: ONLY, value: ""}]
+          resources: {claims: [{name: gpu}]}
+          volumeMounts: [{name: work, mountPath: /work}]
+      containers:
+        - name: deploy
+          image: ghcr.io/your-org/edgevision/edgevision-service:EDGEVISION_TAG
+          command: ["python", "deploy/deploy_engine.py", "/work/engines"]
+          envFrom: [{configMapRef: {name: edgevision-config}}, {secretRef: {name: edgevision-secrets}}]
+          env:
+            - {name: TRITON_URL, value: "http://triton:8000"}
+            - {name: TRITON_MODEL_REPO, value: "s3://minio:9000/models/_triton/ARCH"}
+            - {name: PYTHONPATH, value: /app}
+          volumeMounts:
+            - {name: work, mountPath: /work}
+      volumes:
+        - {name: work, emptyDir: {sizeLimit: 20Gi}}

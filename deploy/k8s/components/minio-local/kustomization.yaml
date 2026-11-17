@@ -1,0 +1,13 @@
+# 叢集內自建 MinIO（測試叢集用；已有物件儲存時改接既有的，見 overlays/<環境>）。
+# 影片不適合放 Longhorn（單 replica、容量有限），所以這個元件只給測試或過渡期。
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - minio.yaml
+images:
+  # minio/minio 已從 Docker Hub 消失，叢集快取也沒有（2026-09-30 實測 ImagePullBackOff）→ 從測試機的本機映像轉推
+  - {name: minio/minio, newName: ghcr.io/your-org/edgevision/edgevision-minio, newTag: "20250907"}
+configMapGenerator:
+  - name: minio-init
+    files:
+      - ../../../minio/init/init-buckets.sh

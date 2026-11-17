@@ -1,0 +1,10 @@
+[project]
+name = "edgevision-rules"
+version = "0.1.0"
+description = "判定原語：幾何（重疊、距離、四角）、時間性（連續幀、冷卻）。純計算、無 I/O、不含任何站別名詞。"
+requires-python = ">=3.10"
+dependencies = ["edgevision-contracts", "numpy>=1.26", "opencv-python-headless>=4.10"]
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13"]
+build-backend = "uv_build"

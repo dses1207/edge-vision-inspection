@@ -1,0 +1,25 @@
+# 存證保留：每天 04:00（台北）把超過 CLIP_RETENTION_DAYS 天的 NG 紀錄的影片連結標成失效（紀錄保留）。
+# 影片檔本身由 MinIO bucket 過期規則刪除（同樣天數，deploy/minio/init/init-buckets.sh）。
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: edgevision-retention}
+spec:
+  schedule: "0 4 * * *"
+  timeZone: Asia/Taipei
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: retention
+              image: edgevision-service
+              command: ["python", "run_retention.py"]
+              envFrom: [{configMapRef: {name: edgevision-config}}, {secretRef: {name: edgevision-secrets}}]
+              env: [{name: CLIP_RETENTION_DAYS, value: "7"}]
+              resources: {requests: {cpu: 10m, memory: 64Mi}, limits: {memory: 256Mi}}

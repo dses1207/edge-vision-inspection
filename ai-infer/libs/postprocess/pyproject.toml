@@ -1,0 +1,10 @@
+[project]
+name = "edgevision-postprocess"
+version = "0.1.0"
+description = "模型輸出張量 → Detection。目前只有 YOLO-seg；綁模型類型，不綁站別，不依賴 Triton client。"
+requires-python = ">=3.10"
+dependencies = ["edgevision-contracts", "numpy>=1.26", "opencv-python-headless>=4.10"]
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13"]
+build-backend = "uv_build"

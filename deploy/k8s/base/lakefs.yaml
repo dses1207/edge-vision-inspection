@@ -1,0 +1,68 @@
+# LakeFS：資料集版本控制。metadata 在 postgres 的 lakefs 資料庫（01-databases.sql 建），物件在 MinIO。
+apiVersion: v1
+kind: Service
+metadata: {name: lakefs}
+spec: {selector: {app: lakefs}, ports: [{name: http, port: 8000, targetPort: 8000}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: lakefs}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: lakefs}}
+  template:
+    metadata: {labels: {app: lakefs}}
+    spec:
+      priorityClassName: edgevision-training
+      containers:
+        - name: lakefs
+          image: treeverse/lakefs@sha256:237a17c6b2d85ba71912aaf82ac61f17dcb4c1884301ff4638bd3d55fa4cb4d0
+          args: [run]
+          env:
+            - {name: LAKEFS_LISTEN_ADDRESS, value: "0.0.0.0:8000"}
+            - {name: LAKEFS_DATABASE_TYPE, value: postgres}
+            - {name: LAKEFS_DATABASE_POSTGRES_CONNECTION_STRING, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: LAKEFS_DATABASE_URL}}}
+            - {name: LAKEFS_AUTH_ENCRYPT_SECRET_KEY, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: LAKEFS_ENCRYPT_SECRET}}}
+            - {name: LAKEFS_BLOCKSTORE_TYPE, value: s3}
+            - {name: LAKEFS_BLOCKSTORE_S3_FORCE_PATH_STYLE, value: "true"}
+            - {name: LAKEFS_BLOCKSTORE_S3_ENDPOINT, value: "http://minio:9000"}
+            - {name: LAKEFS_BLOCKSTORE_S3_DISCOVER_BUCKET_REGION, value: "false"}
+            - {name: LAKEFS_BLOCKSTORE_S3_REGION, value: us-east-1}
+            - {name: LAKEFS_BLOCKSTORE_S3_CREDENTIALS_ACCESS_KEY_ID, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: MINIO_ROOT_USER}}}
+            - {name: LAKEFS_BLOCKSTORE_S3_CREDENTIALS_SECRET_ACCESS_KEY, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: MINIO_ROOT_PASSWORD}}}
+            - {name: LAKEFS_LOGGING_LEVEL, value: INFO}
+            - {name: NO_PROXY, value: "*"}
+            - {name: no_proxy, value: "*"}
+          ports: [{containerPort: 8000}]
+          readinessProbe: {httpGet: {path: /_health, port: 8000}, periodSeconds: 15}
+          resources: {requests: {cpu: 100m, memory: 256Mi}}
+---
+# 建 admin + 固定 access key（金鑰在 Secret，訓練步驟用）。可重複執行：已初始化 / 409 都算成功。
+apiVersion: batch/v1
+kind: Job
+metadata: {name: lakefs-init}
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: init
+          image: curlimages/curl
+          env:
+            - {name: NO_PROXY, value: "*"}
+            - {name: no_proxy, value: "*"}
+            - {name: LAKEFS_ACCESS_KEY, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: LAKEFS_ACCESS_KEY}}}
+            - {name: LAKEFS_SECRET_KEY, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: LAKEFS_SECRET_KEY}}}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              for i in $(seq 1 60); do state=$(curl -s -m 5 http://lakefs:8000/api/v1/setup_lakefs) && break; sleep 5; done
+              echo "lakefs setup state: $state"
+              echo "$state" | grep -q not_initialized || { echo "已初始化，略過"; exit 0; }
+              code=$(curl -s -m 120 -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+                http://lakefs:8000/api/v1/setup_lakefs \
+                -d "{\"username\":\"admin\",\"key\":{\"access_key_id\":\"$LAKEFS_ACCESS_KEY\",\"secret_access_key\":\"$LAKEFS_SECRET_KEY\"}}")
+              case "$code" in 200|201|409) echo "✅ LakeFS 已初始化（HTTP $code）";; *) echo "❌ HTTP $code"; exit 1;; esac

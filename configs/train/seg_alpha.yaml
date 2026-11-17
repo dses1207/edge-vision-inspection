@@ -1,0 +1,48 @@
+# seg_alpha：示範用「板 / 手」分割模型的訓練設定
+#
+# ⚠️ 這份 YAML 是訓練參數的唯一來源，程式碼不 hardcode。
+#    train 區塊原樣透傳 Ultralytics model.train(**train)，鍵名就是 Ultralytics 參數名。
+#    起手值（yolo11m-seg、imgsz 640、400 epochs）。
+model_name: seg_alpha
+task: segment
+base_model: yolo11m-seg.pt            # 映像預載於 /weights；fine-tune 改 registry://seg_alpha/v1
+dataset: lakefs://alpha/main            # 請求的 dataset_ref 會覆蓋；main 只是預設，正式請用版本 ID
+golden:  null                          # 請求的 golden_ref 會覆蓋；null = 用 val 當 Gate 依據
+class_names: [board, hand]
+
+train:
+  epochs: 400
+  imgsz: 640
+  batch: 16
+  patience: 50
+  seed: 0
+  deterministic: true
+  workers: 4
+  device: 0
+  optimizer: auto
+  lr0: 0.01
+  cos_lr: false
+  close_mosaic: 10
+  # 資料增強（legacy 用預設值）
+  fliplr: 0.5
+  mosaic: 1.0
+
+export:
+  imgsz: 640
+  dynamic: true
+  batch: 32        # ⚠️ 必須 >= Triton config max_batch_size（ModelSpec 預設 32）
+  opset: 17        # fuse_masks 接的 Slice/MatMul 子圖用 opset 17；nms=True 匯出也在 17 驗過
+  fp16: false
+  # ⭐ NMS + mask 合成放進 ONNX，Triton 直接輸出每偵測一張 mask（不再搬 prototypes）。
+  #   實測 compute_output −79%、runner CPU −70%，正確性逐框一致。
+  #   max_det 一定要小：每偵測一張 160×160，300 列是 30 MB/幀。一幀最多十來個物件。
+  fuse_masks: true
+  max_det: 16
+
+gates: configs/gates/seg_alpha.yaml
+
+parity:            # 轉檔一致性（PyTorch vs ONNX / TensorRT）
+  images: 8
+  iou_match: 0.8
+  min_match_ratio: 0.9
+  conf_tolerance: 0.05

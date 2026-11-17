@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: triton
+  labels: {app: triton}
+spec:
+  selector: {app: triton}
+  ports:
+    - {name: http, port: 8000, targetPort: 8000}
+    - {name: grpc, port: 8001, targetPort: 8001}
+    - {name: metrics, port: 8002, targetPort: 8002}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: triton}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}          # 模型目錄 RWO、GPU claim 共用：不要新舊兩份同時起
+  selector: {matchLabels: {app: triton}}
+  template:
+    metadata: {labels: {app: triton}}
+    spec:
+      priorityClassName: edgevision-inference
+      runtimeClassName: nvidia
+      resourceClaims: [{name: gpu, resourceClaimName: inference-gpu}]
+      containers:
+        - name: triton
+          image: tritonserver                    # overlay images 換成實際映像（Blackwell 要 25.08）
+          args:
+            - tritonserver
+            - --model-repository=/models
+            - --model-control-mode=explicit
+            # 伺服器起來就算就緒，個別模型載入失敗不擋 Service。
+            # 否則換 GPU 後舊 engine 全部載不進 → 永不就緒 → Service 不轉發 → 新 engine 部署不進去（死結，2026-10-06 踩到）
+            - --strict-readiness=false
+            - --load-model=*                      # 重啟後自己把模型全載回來（compose 版 explicit 重啟會全卸）
+            - --exit-on-error=false               # 某個模型壞掉不拖垮其他模型
+            - --allow-http=true
+            - --allow-grpc=true
+            - --log-verbose=0
+          env: [{name: NO_PROXY, value: "*"}, {name: no_proxy, value: "*"}]
+          ports: [{containerPort: 8000}, {containerPort: 8001}, {containerPort: 8002}]
+          resources:
+            claims: [{name: gpu}]
+            requests: {cpu: "1", memory: 4Gi}
+          volumeMounts:
+            - {name: models, mountPath: /models}
+            - {name: dshm, mountPath: /dev/shm}
+          readinessProbe: {httpGet: {path: /v2/health/ready, port: 8000}, periodSeconds: 10}
+          livenessProbe: {httpGet: {path: /v2/health/live, port: 8000}, initialDelaySeconds: 60, periodSeconds: 20}
+          startupProbe: {httpGet: {path: /v2/health/live, port: 8000}, periodSeconds: 10, failureThreshold: 60}
+      volumes:
+        - {name: models, persistentVolumeClaim: {claimName: triton-models}}
+        - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 1Gi}}
+---
+# 叢集設定：叢集 Prometheus 抓所有 namespace 的 ServiceMonitor，不需特定 label
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata: {name: triton}
+spec:
+  selector: {matchLabels: {app: triton}}
+  endpoints: [{port: metrics, interval: 30s}]

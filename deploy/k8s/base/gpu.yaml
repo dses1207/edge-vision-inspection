@@ -1,0 +1,15 @@
+# 推論卡：一個 ResourceClaim，Triton 與每條線的 runner 都引用同一個 → 共用同一張卡（DRA 允許多 Pod 共用 claim）。
+# UUID 由 overlay 覆寫（每個環境的推論卡不同）。
+# 訓練卡：有專用卡時用 ResourceClaimTemplate（見 overlays/<環境>）；單卡叢集訓練直接共用這個 claim（K8S_GPU_CLAIM）。
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata: {name: inference-gpu}
+spec:
+  devices:
+    requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          selectors:
+            - cel:
+                expression: "device.attributes['gpu.nvidia.com'].uuid == 'GPU-SET-IN-OVERLAY'"

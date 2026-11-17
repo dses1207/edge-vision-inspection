@@ -1,0 +1,10 @@
+[project]
+name = "edgevision-contracts"
+version = "0.2.0"
+description = "全系統共用的資料契約：Detection / Verdict / FrameResult"
+requires-python = ">=3.10"
+dependencies = ["pydantic>=2.9"]
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13"]
+build-backend = "uv_build"

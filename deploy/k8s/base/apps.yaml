@@ -1,0 +1,125 @@
+# edgevision-service 映像的各個入口。envFrom 整份 edgevision-config + edgevision-secrets（= compose 的 env_file .env）。
+# compose 裡 recorder / notifier 用 host 網路、位址寫 localhost；K8s 上一律用 Service 名稱，不需要 host 網路。
+apiVersion: v1
+kind: Service
+metadata: {name: output-api}
+spec:
+  selector: {app: output-api}
+  ports: [{name: http, port: 18080, targetPort: 18080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: output-api}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: output-api}}
+  template:
+    metadata: {labels: {app: output-api}}
+    spec:
+      priorityClassName: edgevision-inference
+      containers:
+        - name: output-api
+          image: edgevision-service
+          command: ["python", "run_api.py"]
+          envFrom: [{configMapRef: {name: edgevision-config}}, {secretRef: {name: edgevision-secrets}}]
+          ports: [{containerPort: 18080}]
+          # /healthz 在依賴異常時回 503：只拿來判斷 ready，不拿來殺進程（DB 抖一下不該把 API 重啟）
+          readinessProbe: {httpGet: {path: /healthz, port: 18080}, periodSeconds: 15}
+          livenessProbe: {tcpSocket: {port: 18080}, initialDelaySeconds: 20, periodSeconds: 20}
+          resources: {requests: {cpu: 200m, memory: 256Mi}}
+          # 站別參數規格（ai-infer CI 從 runner 映像匯出）：設定 API 存檔前檢查用。
+          # 掛整個目錄（不用 subPath）：ConfigMap 更新後 kubelet 會換掉檔案，不用重啟。沒有這個 ConfigMap 也照常啟動，只是不檢查。
+          volumeMounts: [{name: station-specs, mountPath: /etc/edgevision/station-specs, readOnly: true}]
+      volumes:
+        - {name: station-specs, configMap: {name: edgevision-station-specs, optional: true}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: event-processor}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: event-processor}}
+  template:
+    metadata: {labels: {app: event-processor}}
+    spec:
+      priorityClassName: edgevision-inference
+      containers:
+        - name: event-processor
+          image: edgevision-service
+          command: ["python", "run_processor.py"]
+          envFrom: [{configMapRef: {name: edgevision-config}}, {secretRef: {name: edgevision-secrets}}]
+          env: [{name: STATS_INTERVAL_S, value: "60"}]
+          # 同 compose：健康 = Redis 上的 consumer group 還在
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import os,sys,redis; r=redis.Redis.from_url(os.environ['REDIS_URL'],socket_timeout=3,decode_responses=True); sys.exit(0 if any(x['name']==os.environ.get('STORE_GROUP','store') for x in r.xinfo_groups(os.environ.get('REDIS_STREAM_STORE','edgevision:store'))) else 1)"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 8
+          resources: {requests: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: recorder}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: recorder}}
+  template:
+    metadata: {labels: {app: recorder}}
+    spec:
+      priorityClassName: edgevision-inference
+      terminationGracePeriodSeconds: 40     # 同 compose stop_grace_period：讓正在寫的片段收尾
+      # 事件片段先用 GPU（NVENC）編碼、失敗退回 CPU（edgevision/recorder/clip.py）。跟 Triton / runner 共用同一張推論卡。
+      # 消費級卡（如 4080）NVENC 路數常被 runner 用滿 → 自動退回 CPU；專業卡沒有路數上限。
+      runtimeClassName: nvidia
+      resourceClaims: [{name: gpu, resourceClaimName: inference-gpu}]
+      containers:
+        - name: recorder
+          image: edgevision-service
+          command: ["python", "run_recorder.py"]
+          envFrom: [{configMapRef: {name: edgevision-config}}, {secretRef: {name: edgevision-secrets}}]
+          env:
+            - {name: CONFIG_API, value: "http://output-api:18080"}
+            - {name: PRE_RECORD_BUFFER_DIR, value: /prebuffer}
+            - {name: CLIP_PRE_SECONDS, value: "8"}
+            - {name: CLIP_POST_SECONDS, value: "5"}
+            - {name: MIN_FREE_GB, value: "20"}
+            - {name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility,video"}   # video = NVENC
+          volumeMounts: [{name: prebuffer, mountPath: /prebuffer}]
+          livenessProbe:
+            exec: {command: ["sh", "-c", "find /prebuffer -name 'seg*.mp4' -mmin -2 | grep -q ."]}
+            initialDelaySeconds: 120
+            periodSeconds: 60
+            timeoutSeconds: 10
+          resources: {claims: [{name: gpu}], requests: {cpu: 500m, memory: 512Mi}}
+      volumes:
+        # 預錄環形緩衝（每台 300 秒）：可丟棄的暫存 → emptyDir + 上限
+        - {name: prebuffer, emptyDir: {sizeLimit: 20Gi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: notifier}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: notifier}}
+  template:
+    metadata: {labels: {app: notifier}}
+    spec:
+      containers:
+        - name: notifier
+          image: edgevision-service
+          command: ["python", "run_notifier.py"]
+          envFrom: [{configMapRef: {name: edgevision-config}}, {secretRef: {name: edgevision-secrets}}]
+          env:
+            - {name: OUTPUT_API, value: "http://output-api:18080"}
+            - {name: HEALTH_INTERVAL_S, value: "60"}
+            - {name: HEALTH_COOLDOWN_S, value: "600"}
+            - {name: HEALTH_REPEAT_S, value: "14400"}
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import os,psycopg,sys; c=psycopg.connect(os.environ['DATABASE_URL']); r=c.execute(\"SELECT now()-heartbeat_at < interval '90 seconds' FROM service_status WHERE service='notifier'\").fetchone(); sys.exit(0 if r and r[0] else 1)"]
+            initialDelaySeconds: 120
+            periodSeconds: 60
+            timeoutSeconds: 10
+          resources: {requests: {cpu: 50m, memory: 128Mi}}

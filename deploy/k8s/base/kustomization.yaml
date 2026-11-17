@@ -1,0 +1,69 @@
+# EdgeVision on K8s —— 兩個叢集共用的部分。叢集差異在 ../overlays/<env>。
+# ⚠️ 要用 --load-restrictor LoadRestrictionsNone：postgres 初始化 SQL 與 go2rtc 設定直接引用 deploy/ 下的原檔，
+#    不複製（複製了就會跟 compose 版分岔）。用 ../apply.sh 就會帶上。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: edgevision
+labels:
+  - pairs: {app.kubernetes.io/part-of: edgevision}
+    includeSelectors: false
+resources:
+  - registry.yaml                     # 映像來源與 pull secret
+  - config.yaml
+  - gpu.yaml
+  - models-pvc.yaml
+  - postgres.yaml
+  - redis.yaml
+  - triton.yaml
+  - go2rtc.yaml
+  - apps.yaml
+  - control.yaml
+  - ptz.yaml
+  - runner-reconciler.yaml
+  - inference-sites.yaml
+  - retention.yaml
+  - alert-feedback-cron.yaml
+  - clearml.yaml
+  - lakefs.yaml
+  - ingress.yaml
+configMapGenerator:
+  # ⚠️ 不加內容雜湊：加了的話，每新增一個 SQL 檔 ConfigMap 就換名字 → postgres 的 Pod 範本跟著變 → K8s 重啟資料庫
+  #    （斷線約 1 分鐘）。而這些檔只在資料庫第一次建立時才會被 postgres 執行，重啟毫無用處。
+  #    既有資料庫的結構變更由 deploy/ci/migrate_db.sh 在每次部署前補上。
+  - name: postgres-init
+    options: {disableNameSuffixHash: true}
+    files:
+      - ../../postgres/init/01-databases.sql
+      - ../../postgres/init/02-schema.sql
+      - ../../postgres/init/03-camera-config.sql
+      - ../../postgres/init/04-service-status.sql
+      - ../../postgres/init/05-notify.sql
+      - ../../postgres/init/06-line-extras.sql
+      - ../../postgres/init/07-line-status-stats.sql
+      - ../../postgres/init/08-detections-station.sql
+      - ../../postgres/init/09-detections-frame-level.sql
+      - ../../postgres/init/10-detections-evidence-expiry.sql
+      - ../../postgres/init/12-media-library.sql
+      - ../../postgres/init/13-ptz.sql
+      - ../../postgres/init/14-media-select.sql
+      - ../../postgres/init/15-model-intrinsic.sql
+      - ../../postgres/init/16-media-review.sql
+      - ../../postgres/init/17-media-campaign.sql
+      - ../../postgres/init/18-media-campaign-golden.sql
+      - ../../postgres/init/19-media-batches.sql
+      - ../../postgres/init/20-media-campaign-v02.sql
+      - ../../postgres/init/21-media-campaign-collection-unique.sql
+      - ../../postgres/init/22-alert-feedback.sql
+      - ../../postgres/init/23-recordings-library.sql
+      - ../../postgres/init/24-media-collection-drop-task.sql
+      - ../../postgres/init/25-media-collection-org.sql
+      - ../../postgres/init/26-media-campaign-manual.sql
+  - name: go2rtc-files
+    # 固定名稱：overlay 的 go2rtc-siteb 也引用它（雜湊名在 overlay 資源裡不會被改寫，掛載會失敗）。
+    # 代價：改 template / entrypoint 後要自己 rollout restart go2rtc（跟 streams Secret 一樣）。
+    options: {disableNameSuffixHash: true}
+    files:
+      - ../../go2rtc/entrypoint.sh
+      - ../../go2rtc/go2rtc.template.yaml
+generatorOptions:
+  disableNameSuffixHash: false

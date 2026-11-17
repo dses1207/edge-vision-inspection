@@ -1,0 +1,9 @@
+name: zone_intrusion
+display_name: 示範：禁區闖入
+model:
+  name: demo_det
+  task: detect
+handler: edgevision_station_zone_intrusion:ZoneIntrusionStation
+camera_params_required:
+  - zone              # 禁區多邊形，正規化座標 [[x, y], ...]
+owner: ""

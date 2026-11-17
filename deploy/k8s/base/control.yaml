@@ -1,0 +1,105 @@
+# control-api：訓練觸發、模型註冊與部署。JOB_RUNNER=k8s → 訓練步驟建成 Job（edgevision/orchestrator/runner.py K8sRunner）。
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: edgevision-control}
+imagePullSecrets: [{name: registry-pull}]   # 私有 registry 要 pull secret，見 registry.yaml
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: edgevision-control}
+rules:
+  - {apiGroups: [batch], resources: [jobs], verbs: [create, get, list, watch, delete]}
+  - {apiGroups: [batch], resources: [jobs/status], verbs: [get]}
+  - {apiGroups: [""], resources: [pods, pods/log], verbs: [get, list, watch]}
+  - {apiGroups: [""], resources: [services], verbs: [create, get, delete]}      # parity-triton 的同名 Service
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: edgevision-control}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: edgevision-control}
+subjects: [{kind: ServiceAccount, name: edgevision-control}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: control-api}
+spec:
+  selector: {app: control-api}
+  ports: [{name: http, port: 8090, targetPort: 8090}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: control-api}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}          # 掛 RWO 的模型目錄與訓練工作區
+  selector: {matchLabels: {app: control-api}}
+  template:
+    metadata: {labels: {app: control-api}}
+    spec:
+      serviceAccountName: edgevision-control
+      containers:
+        - name: control-api
+          image: edgevision-service
+          command: ["python", "run_control.py"]
+          envFrom: [{configMapRef: {name: edgevision-config}}, {secretRef: {name: edgevision-secrets}}]
+          env:
+            - {name: CONTROL_PORT, value: "8090"}
+            - {name: TRITON_URL, value: "http://triton:8000"}
+            - {name: TRITON_MODEL_REPO, value: /models}
+            - {name: TRAIN_WORK_DIR, value: /work}
+            - {name: JOB_RUNNER, value: k8s}
+            - {name: TRAIN_WORK_VOLUME, value: edgevision-train-work}          # K8sRunner：PVC 名
+            - {name: K8S_JOB_SERVICE_ACCOUNT, value: default}
+            - {name: K8S_PRIORITY_CLASS, value: edgevision-training}
+            - {name: K8S_RUNTIME_CLASS, value: nvidia}
+            # 單卡叢集：訓練跟推論共用同一個 claim。有專用訓練卡時改用 K8S_GPU_CLAIM_TEMPLATE（overlay）
+            - {name: K8S_GPU_CLAIM, value: inference-gpu}
+            # 映像由 overlay 以 patch 設定（TRAINER_IMAGE / EDGEVISION_IMAGE / TRITON_IMAGE）
+          ports: [{containerPort: 8090}]
+          volumeMounts:
+            - {name: models, mountPath: /models}
+            - {name: work, mountPath: /work}
+            - {name: sites, mountPath: /etc/edgevision/sites, readOnly: true}   # 推論站點：promote 時同步到其他節點的 Triton
+            - {name: runner-image, mountPath: /etc/edgevision/runner, readOnly: true}   # 影片測試用線上同一個 runner 映像
+          readinessProbe: {httpGet: {path: /healthz, port: 8090}, periodSeconds: 15}
+          livenessProbe: {tcpSocket: {port: 8090}, initialDelaySeconds: 30, periodSeconds: 20}
+          resources: {requests: {cpu: 100m, memory: 256Mi}}
+      volumes:
+        - {name: models, persistentVolumeClaim: {claimName: triton-models}}
+        - {name: work, persistentVolumeClaim: {claimName: edgevision-train-work}}
+        - {name: sites, configMap: {name: edgevision-inference-sites}}
+        # 不在 kustomize 裡（見 runner-reconciler.yaml）；optional：還沒建時 control-api 照樣起得來
+        - {name: runner-image, configMap: {name: edgevision-runner, optional: true}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: mcp-server}
+spec:
+  selector: {app: mcp-server}
+  ports: [{name: http, port: 8096, targetPort: 8096}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: mcp-server}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: mcp-server}}
+  template:
+    metadata: {labels: {app: mcp-server}}
+    spec:
+      containers:
+        - name: mcp-server
+          image: edgevision-service
+          command: ["python", "-m", "edgevision.mcp.remote"]
+          envFrom: [{configMapRef: {name: edgevision-config}}]
+          env:
+            - {name: CONTROL_URL, value: "http://control-api:8090"}
+            # 控制 API 以外的服務（edgevision/mcp/platform_tools.py：線路設定 / 偵測、報表、PTZ）
+            - {name: OUTPUT_URL, value: "http://output-api:18080"}
+            - {name: PTZ_URL, value: "http://ptz:8097"}
+            - {name: MCP_PORT, value: "8096"}
+          ports: [{containerPort: 8096}]
+          # 不用 httpGet：MCP SDK 的 DNS rebinding 防護只認 MCP_PUBLIC_URL 的 Host，探測帶 Pod IP 會被回 421
+          readinessProbe: {tcpSocket: {port: 8096}, periodSeconds: 20}
+          livenessProbe: {tcpSocket: {port: 8096}, initialDelaySeconds: 20, periodSeconds: 30}
+          resources: {requests: {cpu: 50m, memory: 128Mi}}

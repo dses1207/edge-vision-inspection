@@ -1,0 +1,7 @@
+# wildlife_det Gate：偵測模型（沒有 seg 指標）。門檻取公開基準的保守值，先驗機制。
+absolute:
+  map50_box: 0.60
+critical_recall:
+  elephant: 0.50
+latency_ms_max: 50
+golden_no_new_miss: true

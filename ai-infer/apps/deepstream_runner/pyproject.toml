@@ -1,0 +1,29 @@
+[project]
+name = "edgevision-deepstream-runner"
+version = "0.1.0"
+description = "判讀室：DeepStream 管線 app。組 GStreamer、掛 probe、worker 呼叫後處理與站別判定。"
+requires-python = ">=3.10"
+dependencies = [
+    "edgevision-contracts",
+    "edgevision-postprocess",
+    "edgevision-station-sdk",
+    # 全部站別都裝進同一個映像（純 Python、幾 KB）；哪條線路用哪站由啟動參數決定
+    "edgevision-station-template",
+    "edgevision-station-zone-intrusion",
+    "edgevision-station-followup-window",
+    "edgevision-station-ppe-check",
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+    "redis>=5.0",
+]
+# pyds、gi 不在 PyPI，由 Dockerfile 在 DeepStream 基底上安裝；這裡不宣告，程式碼延遲 import
+
+[project.scripts]
+ds-runner = "ds_runner.pipeline:main"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "ds_runner"     # 套件名 edgevision-deepstream-runner，模組名刻意短：容器裡 import ds_runner

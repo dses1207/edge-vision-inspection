@@ -1,0 +1,47 @@
+# Traefik（叢集預設 ingressClass）。TLS 只寫 hosts、不填 secretName → 用平台預設的 *.example.com 憑證。
+# 網域在 overlay 換成自己的（見 overlays/example）。
+# go2rtc 不走這裡：hostNetwork，瀏覽器直連節點 IP（見 go2rtc.yaml）。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: edgevision}
+spec:
+  tls: [{hosts: [edgevision.example.com]}]
+  rules:
+    - host: edgevision.example.com
+      http:
+        paths:
+          # control-api 的路徑（與 output-api 不重疊，逐條列出）
+          - {path: /api/training, pathType: Prefix, backend: {service: {name: control-api, port: {number: 8090}}}}
+          - {path: /api/tasks, pathType: Prefix, backend: {service: {name: control-api, port: {number: 8090}}}}
+          - {path: /api/datasets, pathType: Prefix, backend: {service: {name: control-api, port: {number: 8090}}}}
+          - {path: /api/configs, pathType: Prefix, backend: {service: {name: control-api, port: {number: 8090}}}}
+          - {path: /api/models, pathType: Prefix, backend: {service: {name: control-api, port: {number: 8090}}}}
+          # 圖片庫 / 標注 / 自動標注
+          - {path: /api/media, pathType: Prefix, backend: {service: {name: control-api, port: {number: 8090}}}}
+          # 標注審核前端（web/review，control-api 直接給靜態檔）
+          - {path: /review, pathType: Prefix, backend: {service: {name: control-api, port: {number: 8090}}}}
+          # PTZ（獨立服務；OpenAPI 在 /api/ptz/openapi.json）
+          - {path: /api/ptz, pathType: Prefix, backend: {service: {name: ptz, port: {number: 8097}}}}
+          # 控制 API 的 OpenAPI 規格與 /docs（推論 API 的在根目錄 /openapi.json、/docs）
+          - {path: /api/control, pathType: Prefix, backend: {service: {name: control-api, port: {number: 8090}}}}
+          - {path: /mcp, pathType: Prefix, backend: {service: {name: mcp-server, port: {number: 8096}}}}
+          - {path: /.well-known, pathType: Prefix, backend: {service: {name: mcp-server, port: {number: 8096}}}}
+          # 影像（MSE / WebRTC 信令）：go2rtc 的 base_path 就是 /go2rtc，原封不動轉過去（不需 strip-prefix）
+          - {path: /go2rtc, pathType: Prefix, backend: {service: {name: go2rtc, port: {number: 1984}}}}
+          # 其餘（/api/config、/api/cameras、/api/detections、/healthz、/ws …）→ output-api
+          - {path: /, pathType: Prefix, backend: {service: {name: output-api, port: {number: 18080}}}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: edgevision-train}
+spec:
+  tls: [{hosts: [clearml.example.com, clearml-api.example.com, clearml-files.example.com, lakefs.example.com]}]
+  rules:
+    - host: clearml.example.com
+      http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: clearml-webserver, port: {number: 80}}}}]}
+    - host: clearml-api.example.com
+      http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: clearml-apiserver, port: {number: 8008}}}}]}
+    - host: clearml-files.example.com
+      http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: clearml-fileserver, port: {number: 8081}}}}]}
+    - host: lakefs.example.com
+      http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: lakefs, port: {number: 8000}}}}]}

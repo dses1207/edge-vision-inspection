@@ -1,0 +1,53 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  secrets:
+    # 公開 repo 的最後一道防線：任何 commit 帶進金鑰、token 都擋下來
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  ai-infer:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: ai-infer } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-packages --frozen
+      - run: uv run ruff check .
+      - name: runner requirements.txt 與 uv.lock 一致
+        run: |
+          for app in deepstream_runner cpu_runner; do
+            pkg=edgevision-$(echo $app | tr _ -)
+            uv export --frozen --no-dev --no-emit-workspace --no-hashes --package $pkg -o /tmp/req.txt
+            diff <(grep -v '^#' /tmp/req.txt) <(grep -v '^#' apps/$app/requirements.txt)
+          done
+      - run: uv run pytest -q
+
+  platform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest -q tests --ignore=tests/integration
+
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: kustomize 渲染範例 overlay
+        run: kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/k8s/overlays/example > /dev/null
+      - name: compose 設定合法（demo 與單機完整堆疊）
+        run: |
+          (cd demo && cp .env.example .env && docker compose config -q)
+          (cd deploy && cp .env.example .env && docker compose config -q)

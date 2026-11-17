@@ -1,0 +1,63 @@
+# 標注審核的全域預設值
+#
+# ⭐ 這是唯一放預設數字的地方。程式只定義欄位與合法範圍（edgevision/media/review.py），不帶任何預設值；
+#    這裡少了欄位，服務一讀設定就報錯。
+# ⭐ 平常全部用這裡的值；某個圖片集要調，用 PATCH /api/media/collections/{id}/review-config
+#    只寫要覆蓋的欄位進資料庫（media_collections.review_config）。改這個檔要重新部署。
+
+# 每個類別的預設（圖片集可用 classes.<類別名>.<欄位> 個別覆蓋）
+class_defaults:
+  show_conf: 0.10        # 信心 ≥ 這個才給前端看（低於 accept_conf 的畫成虛線「候選框」）
+  accept_conf: 0.50      # 信心 ≥ 這個預設保留（實線）
+  bulk_accept: true      # 能不能被「批次通過」
+  rare: false            # 少見類別：圖上有就優先審（priority 的 rare 訊號）
+
+# 類別顏色依類別順序輪用；快捷鍵 = 第 1–9 類對應 1–9（圖片集可用 classes.<名>.color / hotkey 覆蓋）
+palette: ["#e5534b", "#c94bd6", "#f2cc60", "#3fb950", "#39c5cf", "#6e7bff", "#ff9b3d", "#8bd450", "#d4a5ff", "#a0a0a0"]
+
+swap_pairs: []           # Q 鍵互換的類別對，例：[["glove", "tap"]]
+
+round:
+  size: 250
+  size_min: 20
+  size_max: 1000
+  blind_ratio: 0.05      # 抽查圖比例：不顯示預標、從頭標，用來量模型與審核品質
+  blind_ratio_max: 0.20
+  max_per_group: 2       # 挑圖時同一個相似群（select_info.group）最多幾張，避免一輪都是幾乎一樣的畫面
+
+priority:                # 優先分數 = Σ 權重 × 訊號（訊號 0–1）；訊號 ≥ reason_min 才列進 reasons
+  reason_min: 0.5
+  weights:
+    rare: 3.0            # 圖上有 rare 類別的框（信心 ≥ show_conf）
+    low_conf: 1.5        # 有介於 show_conf 與 accept_conf 之間的框（越接近中間越高）
+    empty: 1.0           # 模型什麼都沒畫（可能漏標，也可能真的沒東西）
+    diverse: 1.0         # 代表的相似畫面多（select_info.group_size 大）
+  diverse_group_size: 30 # group_size 到這個數，diverse 訊號 = 1
+
+sequence:
+  frames_before: 10
+  frames_after: 10
+  on_target_ratio: 0.70
+
+bulk_accept:
+  default_conf: 0.80
+  preview_n: 12
+
+review:
+  require_clean_view: true
+  clean_view_ms: 800
+  min_box_px: 4
+  idle_s: 60
+  lock_s: 300
+  lock_renew_s: 120
+  draft_debounce_ms: 2000
+  offline_retry_s: 5
+  offline_retry_max_s: 60
+  peek: 2
+
+qa:
+  iou: 0.5               # 品質報告：模型框與人工框 IoU ≥ 這個算對上
+
+thumb_px: 480            # 縮圖長邊
+
+guide: []                # 標註規範：[{"class": "tap", "text": "...", "examples": [{"url", "good", "caption"}]}]

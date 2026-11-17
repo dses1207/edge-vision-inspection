@@ -1,0 +1,58 @@
+# 非機密設定 = compose 的 .env 扣掉密碼。所有 edgevision 服務 envFrom 這份 + Secret edgevision-secrets（見 ../make_secrets.py）。
+# 服務名稱跟 compose 一模一樣（postgres / minio / redis / triton / go2rtc …），程式裡的位址不用改。
+# 各叢集不同的值（IP、網域、映像）由 overlay 的 configMapGenerator merge 覆寫。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edgevision-config
+data:
+  TZ: Asia/Taipei
+  LOG_LEVEL: INFO
+  # ── 資料層 ──
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: edgevision
+  POSTGRES_DB: edgevision
+  MINIO_ENDPOINT: minio:9000
+  MINIO_SECURE: "false"
+  REDIS_URL: redis://redis:6379/0
+  REDIS_STREAM: edgevision:events
+  # ── 推論 ──
+  TRITON_URL: triton:8000
+  TRITON_GRPC: triton:8001
+  GO2RTC_API: http://go2rtc:1984/go2rtc   # go2rtc 設了 base_path（見 go2rtc.yaml）
+  GO2RTC_RTSP: rtsp://go2rtc:8554
+  CAMERA_SOURCE: api
+  API_PORT: "18080"
+  CONTROL_PORT: "8090"
+  # ── 訓練 ──
+  CLEARML_API_HOST: http://clearml-apiserver:8008
+  CLEARML_WEB_HOST: http://clearml-webserver:80
+  CLEARML_FILES_HOST: http://clearml-fileserver:8081
+  CLEARML_PROJECT: edgevision
+  CLEARML_OUTPUT_URI: s3://minio:9000/experiments/
+  LAKEFS_ENDPOINT: http://lakefs:8000
+  TASK_HEARTBEAT_TIMEOUT: "1800"
+  TRT_PARITY: "true"
+  # ── 對外（overlay 覆寫）──
+  WEBRTC_IP: "0.0.0.0"
+  CORS_ORIGINS: ""
+  GO2RTC_PUBLIC_URL: ""
+  MCP_PUBLIC_URL: ""
+  # ── 認證（同 compose 預設：關）──
+  AUTH_ENABLED: "false"
+  AUTH_SERVER: https://auth.example.com
+  AUTH_AUDIENCE: edgevision_api
+  AUTH_ALLOW_HEADER_ACTOR: "true"
+  AUTH_VERIFY_TLS: "false"
+  # ── 通知（沒設 = 乾跑，決定先不設）──
+  NOTIFY_DAILY: ""
+  NOTIFY_HEALTH: ""
+  NOTIFY_NG: ""
+  NOTIFY_DAILY_AT: "08:00"
+  # 叢集內一律不走 proxy（叢集設定：Pod 不會自動吃 proxy；要出外網的 Pod 自己設）
+  NO_PROXY: "*"
+  no_proxy: "*"
+  # 訓練容器（trainer 步驟）出外網用；空字串 = 不走 proxy。NO_PROXY 會再自動加上 minio、lakefs 等服務短名
+  TRAIN_HTTPS_PROXY: "http://192.0.2.118:15629"
+  TRAIN_NO_PROXY: "localhost,127.0.0.1,192.0.2.31/8,192.0.2.31/16,192.0.2.31/16,192.0.2.31/16,.svc,.cluster.local,.example.com"

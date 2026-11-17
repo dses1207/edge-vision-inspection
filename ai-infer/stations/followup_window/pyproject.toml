@@ -1,0 +1,13 @@
+[project]
+name = "edgevision-station-followup-window"
+version = "0.1.0"
+description = "示範站：看到觸發類別後 N 秒內必須看到必要類別，否則 NG（時間性判定，NG 當下可能沒有框）。"
+requires-python = ">=3.10"
+dependencies = ["edgevision-contracts", "edgevision-rules", "edgevision-station-sdk"]
+
+[project.entry-points."edgevision.stations"]
+followup_window = "edgevision_station_followup_window:FollowupWindowStation"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13"]
+build-backend = "uv_build"

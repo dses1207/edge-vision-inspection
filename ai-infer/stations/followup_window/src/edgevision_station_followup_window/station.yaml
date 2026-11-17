@@ -1,0 +1,10 @@
+name: followup_window
+display_name: 示範：觸發後限時確認
+model:
+  name: demo_det
+  task: detect
+handler: edgevision_station_followup_window:FollowupWindowStation
+camera_params_required:
+  - trigger_class     # 看到它就開始計時
+  - required_class    # 計時內必須出現
+owner: ""

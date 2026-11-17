@@ -1,0 +1,49 @@
+# ⚠️ hostNetwork：WebRTC 的 ICE 要主機真實 IP（走 Pod 網路 candidate 會錯、前端連不上）。
+#    瀏覽器直連節點 IP 的 1984（API/網頁）與 8555（WebRTC，TCP+UDP），不經 Ingress。
+#    叢集管理者要知道並同意。日後啟用 PSA 時此 namespace 需 privileged。
+# 叢集內其他 Pod 照樣用 Service 名稱：RTSP go2rtc:8554（runner）；HTTP API 要帶前綴 go2rtc:1984/go2rtc（recorder）。
+# 瀏覽器看影像走 Ingress https://<網域>/go2rtc（wss），WebRTC 的媒體仍直連節點 8555。
+apiVersion: v1
+kind: Service
+metadata: {name: go2rtc}
+spec:
+  selector: {app: go2rtc}
+  ports:
+    - {name: api, port: 1984, targetPort: 1984}
+    - {name: rtsp, port: 8554, targetPort: 8554}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: go2rtc}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}          # hostNetwork 綁主機埠：新舊不能同時在
+  selector: {matchLabels: {app: go2rtc}}
+  template:
+    metadata: {labels: {app: go2rtc}}
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: edgevision-inference
+      containers:
+        - name: go2rtc
+          image: alexxit/go2rtc@sha256:675c318b23c06fd862a61d262240c9a63436b4050d177ffc68a32710d9e05bae
+          command: ["/bin/sh", "/scripts/entrypoint.sh"]
+          env:
+            - {name: WEBRTC_IP, valueFrom: {configMapKeyRef: {name: edgevision-config, key: WEBRTC_IP}}}
+            # 經 Ingress 掛在 /go2rtc：https 頁面才能用 wss 看影像（ws:// 會被瀏覽器當混合內容，Firefox 直接擋）
+            - {name: GO2RTC_BASE_PATH, value: /go2rtc}
+            - {name: CAM_USER, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: CAM_USER, optional: true}}}
+            - {name: CAM_PASS, valueFrom: {secretKeyRef: {name: edgevision-secrets, key: CAM_PASS, optional: true}}}
+          volumeMounts:
+            - {name: scripts, mountPath: /scripts}
+            - {name: template, mountPath: /config/go2rtc.template.yaml, subPath: go2rtc.template.yaml}
+            # 相機清單 = cameras 表的投影，含明碼帳密 → Secret。由 gen_go2rtc_streams.py 產生後建立（見 README）
+            - {name: streams, mountPath: /config/streams.generated.yaml, subPath: streams.generated.yaml}
+          readinessProbe: {httpGet: {path: /go2rtc/api/streams, port: 1984}, periodSeconds: 15}
+          livenessProbe: {httpGet: {path: /go2rtc/api/streams, port: 1984}, initialDelaySeconds: 15, periodSeconds: 20}
+          resources: {requests: {cpu: 200m, memory: 128Mi}}
+      volumes:
+        - {name: scripts, configMap: {name: go2rtc-files, items: [{key: entrypoint.sh, path: entrypoint.sh}]}}
+        - {name: template, configMap: {name: go2rtc-files, items: [{key: go2rtc.template.yaml, path: go2rtc.template.yaml}]}}
+        - {name: streams, secret: {secretName: go2rtc-streams}}

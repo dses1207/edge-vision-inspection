@@ -1,0 +1,160 @@
+# EdgeVision demo：一行指令起整條鏈路，不需要 GPU、相機或模型。
+#
+#   cd demo && cp .env.example .env && docker compose up -d --build
+#
+#   合成畫面 ─► cpu-runner ─► Redis Streams ─┬─► event-processor ─► Postgres（偵測紀錄）
+#   (Scene)     (worker+站別)                 ├─► recorder ─► MinIO（NG 前後的存證影片，錄的是燒好框的 _marked）
+#                  │                          └─► output-api（WebSocket 即時結果、查詢、判定回饋）
+#                  └─ ffmpeg ─► go2rtc（<cam> 原始 / <cam>_marked 已燒框）
+#
+# 看得到的地方：
+#   http://localhost:1984/stream.html?src=cam-01_marked   直播（框已燒進畫面）
+#   http://localhost:8080/docs                             output-api（線路設定、偵測紀錄、統計）
+#   http://localhost:9001                                  MinIO console（inference-output/ 底下是存證影片）
+name: edgevision-demo
+
+x-logging: &logging
+  driver: json-file
+  options: {max-size: "10m", max-file: "3"}     # log 不設上限遲早塞爆磁碟
+
+x-app: &app
+  build: {context: .., dockerfile: Dockerfile}
+  image: edgevision-service:demo
+  restart: unless-stopped
+  logging: *logging
+  env_file: [.env]
+  working_dir: /app
+
+x-db-env: &db-env
+  DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  REDIS_URL: redis://redis:6379/0
+  MINIO_ENDPOINT: minio:9000
+  MINIO_PUBLIC_URL: http://localhost:${MINIO_PORT:-9000}
+  CONTROL_URL: http://127.0.0.1:9              # demo 不起 Registry：設定 API 立刻退回 model_info_cache
+  NO_PROXY: "*"
+  no_proxy: "*"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ../deploy/postgres/init:/edgevision-init:ro
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *logging
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 20
+
+  minio:
+    # MinIO 官方已不在 Docker Hub 發佈映像；這裡用 Chainguard 的建置（沒有 shell，所以初始化改用 Python）
+    image: cgr.dev/chainguard/minio:latest
+    restart: unless-stopped
+    logging: *logging
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes: ["minio-data:/data"]
+    ports: ["${MINIO_PORT:-9000}:9000", "${MINIO_CONSOLE_PORT:-9001}:9001"]
+
+  minio-init:
+    <<: *app
+    restart: "no"
+    command: ["python", "/demo/init_buckets.py"]
+    environment: *db-env
+    volumes: ["./init_buckets.py:/demo/init_buckets.py:ro"]
+    depends_on: [minio]
+
+  go2rtc:
+    image: alexxit/go2rtc:1.9.9
+    restart: unless-stopped
+    logging: *logging
+    volumes: ["./go2rtc.yaml:/config/go2rtc.yaml:ro"]
+    ports: ["${GO2RTC_PORT:-1984}:1984", "${RTSP_PORT:-8554}:8554", "8555:8555/tcp", "8555:8555/udp"]
+
+  output-api:
+    <<: *app
+    command: ["python", "run_api.py"]
+    environment:
+      <<: *db-env
+      API_PORT: "8080"
+      GO2RTC_PUBLIC_URL: http://localhost:${GO2RTC_PORT:-1984}
+      MONITOR_UI_ENABLED: "false"
+    ports: ["${API_PORT:-8080}:8080"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+      interval: 5s
+      retries: 30
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
+
+  event-processor:
+    <<: *app
+    command: ["python", "run_processor.py"]
+    environment: *db-env
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+  recorder:
+    <<: *app
+    command: ["python", "run_recorder.py"]
+    stop_grace_period: 20s
+    environment:
+      <<: *db-env
+      CONFIG_API: http://output-api:8080
+      GO2RTC_RTSP: rtsp://go2rtc:8554
+      GO2RTC_API: http://go2rtc:1984
+      PRE_RECORD_BUFFER_DIR: /prebuffer
+      MIN_FREE_GB: "2"
+      CLIP_PRE_SECONDS: "6"
+      CLIP_POST_SECONDS: "4"
+      CLIP_ENCODER: x264                        # demo 沒有 GPU：直接用 CPU 轉檔（auto 會先試 NVENC 失敗再退回）
+    tmpfs: ["/prebuffer:size=512m"]
+    depends_on:
+      output-api: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
+
+  # 一條線一個 runner（正式環境也是：一條線一個 Pod，由 runner 調和器依線路設定建立）
+  runner-demo-zone: &runner
+    build: {context: .., dockerfile: ai-infer/apps/cpu_runner/Dockerfile}
+    image: edgevision-cpu-runner:demo
+    restart: unless-stopped
+    logging: *logging
+    environment: &runner-env
+      CAMERA_SOURCE: api
+      CONFIG_API: http://output-api:8080
+      LINE_ID: demo_zone
+      REDIS_URL: redis://redis:6379/0
+      GO2RTC_RTSP: rtsp://go2rtc:8554
+      NO_PROXY: "*"
+      no_proxy: "*"
+    depends_on:
+      output-api: {condition: service_healthy}
+      go2rtc: {condition: service_started}
+
+  runner-demo-dock:
+    <<: *runner
+    environment:
+      <<: *runner-env
+      LINE_ID: demo_dock
+
+volumes:
+  minio-data:

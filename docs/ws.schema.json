@@ -1,0 +1,315 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WsMessage",
+  "description": "output-api /ws 推播的訊息。用 type 欄位判別種類 —— 不要靠「有沒有某個 key」。由 scripts/gen_ws_schema.py 從 edgevision/api/schemas.py 產生，不要手改。",
+  "oneOf": [
+    {
+      "description": "連線時先收到的一則：各相機的基準四邊形。",
+      "properties": {
+        "type": {
+          "const": "ref_quads",
+          "title": "Type",
+          "type": "string"
+        },
+        "ref_quads": {
+          "additionalProperties": {
+            "items": {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "title": "Flip Refs",
+          "type": "object"
+        }
+      },
+      "required": [
+        "type",
+        "ref_quads"
+      ],
+      "title": "WsFlipRefs",
+      "type": "object",
+      "additionalProperties": false
+    },
+    {
+      "description": "/ws 的每筆推論結果。\n\n⚠️ 這是廣播 —— 所有相機的結果都會送到每個連線，前端自己用 camera_id 過濾。",
+      "properties": {
+        "type": {
+          "const": "result",
+          "title": "Type",
+          "type": "string"
+        },
+        "camera_id": {
+          "title": "Camera Id",
+          "type": "string"
+        },
+        "frame_id": {
+          "title": "Frame Id",
+          "type": "string"
+        },
+        "marker_id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Marker Id"
+        },
+        "model_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Name"
+        },
+        "model_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Version"
+        },
+        "detections": {
+          "items": {
+            "properties": {
+              "class_id": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Class Id"
+              },
+              "class_name": {
+                "title": "Class Name",
+                "type": "string"
+              },
+              "confidence": {
+                "title": "Confidence",
+                "type": "number"
+              },
+              "bbox": {
+                "description": "原圖像素座標（coord_system=original 時已由後端還原 letterbox）。",
+                "properties": {
+                  "x1": {
+                    "title": "X1",
+                    "type": "number"
+                  },
+                  "y1": {
+                    "title": "Y1",
+                    "type": "number"
+                  },
+                  "x2": {
+                    "title": "X2",
+                    "type": "number"
+                  },
+                  "y2": {
+                    "title": "Y2",
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "x1",
+                  "y1",
+                  "x2",
+                  "y2"
+                ],
+                "title": "BBoxOut",
+                "type": "object",
+                "additionalProperties": false
+              },
+              "has_mask": {
+                "default": false,
+                "title": "Has Mask",
+                "type": "boolean"
+              },
+              "mask_area": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Mask Area"
+              },
+              "mask_contour": {
+                "anyOf": [
+                  {
+                    "items": {
+                      "items": {
+                        "type": "number"
+                      },
+                      "type": "array"
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Mask Contour"
+              },
+              "keypoints": {
+                "anyOf": [
+                  {
+                    "items": {
+                      "items": {
+                        "type": "number"
+                      },
+                      "type": "array"
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Keypoints"
+              },
+              "metrics": {
+                "additionalProperties": true,
+                "title": "Metrics",
+                "type": "object"
+              }
+            },
+            "required": [
+              "class_name",
+              "confidence",
+              "bbox"
+            ],
+            "title": "DetectionOut",
+            "type": "object",
+            "additionalProperties": false
+          },
+          "title": "Detections",
+          "type": "array"
+        },
+        "verdict": {
+          "anyOf": [
+            {
+              "properties": {
+                "status": {
+                  "enum": [
+                    "ok",
+                    "ng"
+                  ],
+                  "title": "Status",
+                  "type": "string"
+                },
+                "reason": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "title": "Reason"
+                },
+                "details": {
+                  "additionalProperties": true,
+                  "title": "Details",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "title": "VerdictOut",
+              "type": "object",
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "image_meta": {
+          "anyOf": [
+            {
+              "properties": {
+                "width": {
+                  "title": "Width",
+                  "type": "integer"
+                },
+                "height": {
+                  "title": "Height",
+                  "type": "integer"
+                },
+                "letterbox": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "title": "Letterbox"
+                }
+              },
+              "required": [
+                "width",
+                "height"
+              ],
+              "title": "ImageMetaOut",
+              "type": "object",
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "coord_system": {
+          "default": "original",
+          "enum": [
+            "original",
+            "letterboxed"
+          ],
+          "title": "Coord System",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "camera_id",
+        "frame_id"
+      ],
+      "title": "WsResult",
+      "type": "object",
+      "additionalProperties": false
+    }
+  ]
+}
