@@ -58,6 +58,8 @@ configMapGenerator:
       - ../../postgres/init/24-media-collection-drop-task.sql
       - ../../postgres/init/25-media-collection-org.sql
       - ../../postgres/init/26-media-campaign-manual.sql
+      - ../../postgres/init/27-permissions.sql
+      - ../../postgres/init/28-auth-unverified.sql
   - name: go2rtc-files
     # 固定名稱：overlay 的 go2rtc-siteb 也引用它（雜湊名在 overlay 資源裡不會被改寫，掛載會失敗）。
     # 代價：改 template / entrypoint 後要自己 rollout restart go2rtc（跟 streams Secret 一樣）。

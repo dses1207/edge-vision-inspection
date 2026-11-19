@@ -521,8 +521,13 @@ def main() -> int:
         print("用法：python -m edgevision.media.alerts run", file=sys.stderr)
         return 2
     url = os.environ.get("CONTROL_API", "http://control-api:8090").rstrip("/") + "/api/media/alerts/feedback/run"
-    req = urllib.request.Request(url, data=b"{}", method="POST", headers={
-        "Content-Type": "application/json", "X-Actor": SYSTEM_ACTOR, "X-Actor-Type": "system", "X-Channel": "cron"})
+    # 服務金鑰（K8s Secret edgevision-service-tokens 的 alert-feedback）：身分記成 system:alert-feedback。
+    # 以前送 X-Channel: cron 會被控制 API 擋成 400（只收 ui|mcp|api），回流其實沒在跑。
+    headers = {"Content-Type": "application/json", "X-Actor": SYSTEM_ACTOR, "X-Actor-Type": "system",
+               "X-Channel": "system"}
+    if os.environ.get("EDGEVISION_SERVICE_TOKEN"):
+        headers["X-Service-Token"] = os.environ["EDGEVISION_SERVICE_TOKEN"]
+    req = urllib.request.Request(url, data=b"{}", method="POST", headers=headers)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))      # 叢集內，不走 proxy
     with opener.open(req, timeout=300) as r:
         out = json.loads(r.read())

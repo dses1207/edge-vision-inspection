@@ -93,6 +93,17 @@ def build_verifier():
     return OidcTokenVerifier()
 
 
+def current_token() -> str:
+    """這次請求已驗證的原始 token：轉給控制 API，讓只認 token 的端點（/api/permissions）也能用。"""
+    try:
+        from mcp.server.auth.middleware.auth_context import get_access_token
+
+        tok = get_access_token()
+        return str(tok.token) if tok and tok.token else ""
+    except Exception:
+        return ""
+
+
 def current_subject() -> str:
     """取出這次請求已驗證的身分。SDK 把它放在 contextvar 裡。"""
     try:
@@ -138,6 +149,9 @@ def _call(method: str, path: str, *, json_body: dict | None = None, params: dict
         "X-Channel": "mcp",
         "Content-Type": "application/json",
     }
+    tok = current_token()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"   # 有 token 時控制 API 以 token 的 sub 為準（與 X-Actor 同一人）
     from edgevision.mcp.platform_tools import service_url
 
     base = service_url(path, CONTROL_URL)
@@ -150,13 +164,25 @@ def _call(method: str, path: str, *, json_body: dict | None = None, params: dict
     if r.status_code >= 400:
         detail = r.text[:500]
         try:
-            detail = r.json().get("detail", detail)
+            j = r.json()
+            detail = j.get("detail") or _envelope_error(j) or detail   # 舊端點 detail；新端點標準回應外殼 error
         except Exception:
             pass
         raise ToolError(f"控制 API 回 {r.status_code}：{detail}")
 
     ct = r.headers.get("content-type", "")
     return r.json() if ct.startswith("application/json") else r.text
+
+
+def _envelope_error(j: dict) -> str:
+    """標準回應外殼的錯誤：message ＋ 驗證明細（agent 才知道哪個欄位錯）。"""
+    e = j.get("error") if isinstance(j, dict) else None
+    if not isinstance(e, dict):
+        return ""
+    msg = f"{e.get('code', '')}: {e.get('message', '')}"
+    if e.get("details"):
+        msg += " " + "; ".join(f"{d.get('field')} {d.get('code')} {d.get('message')}" for d in e["details"])
+    return msg
 
 
 def _safe(fn):

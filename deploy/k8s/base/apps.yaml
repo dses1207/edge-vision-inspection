@@ -22,6 +22,10 @@ spec:
           image: edgevision-service
           command: ["python", "run_api.py"]
           envFrom: [{configMapRef: {name: edgevision-config}}, {secretRef: {name: edgevision-secrets}}]
+          env:
+            # 服務金鑰：設定 API 向控制 API 查模型資訊時帶（edgevision/api/model_info.py），身分 system:output-api
+            - name: EDGEVISION_SERVICE_TOKEN
+              valueFrom: {secretKeyRef: {name: edgevision-service-tokens, key: output-api, optional: true}}
           ports: [{containerPort: 18080}]
           # /healthz 在依賴異常時回 503：只拿來判斷 ready，不拿來殺進程（DB 抖一下不該把 API 重啟）
           readinessProbe: {httpGet: {path: /healthz, port: 18080}, periodSeconds: 15}

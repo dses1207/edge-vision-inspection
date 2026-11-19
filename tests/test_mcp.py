@@ -151,6 +151,8 @@ def test_tool_levels(tools):
         "list_ptz_cameras": "read", "get_ptz_state": "read", "move_ptz": "write", "goto_ptz": "write",
         "save_ptz_position": "destructive", "ptz_drift": "write", "calibrate_ptz_motor": "destructive",
         "set_ptz_can_pan": "write",
+        "get_permissions": "read", "get_my_permission_identity": "read", "update_permissions": "destructive", "list_unverified_api_calls": "read",
+        "search_permission_people": "read", "get_directory_sync_status": "read", "run_directory_sync": "write",
     }
     assert set(tools) == set(expect)
     for name, want in expect.items():
@@ -300,6 +302,8 @@ _MCP_EXEMPT = {
     ("GET", "/api/media/videos/{}/stream"): "二進位影片串流",
     ("GET", "/api/media/videos/{}/thumbnail"): "二進位縮圖；list_media_videos 有 thumbnail_url",
     ("GET", "/api/ptz/{}/snapshot"): "二進位 JPEG",
+    ("POST", "/api/permissions/login"): "ipcam-web 登入時用使用者 token 建立人員；agent 代呼叫沒有意義",
+    ("POST", "/api/control/auth/signed-urls"): "給瀏覽器 <video src> / <img src> 用的網址簽名；agent 直接帶 token 呼叫就好",
 }
 
 

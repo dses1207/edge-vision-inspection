@@ -34,8 +34,9 @@ def test_missing_actor_is_anonymous():
 
 
 def test_bad_channel_rejected():
+    # cron 從第二期起是合法值（告警回流排程一直送這個，以前被擋成 400）
     with pytest.raises(ValueError, match="X-Channel"):
-        auth.resolve(None, "alice", None, "cron")
+        auth.resolve(None, "alice", None, "webhook")
 
 
 def test_strict_mode_requires_token(monkeypatch):

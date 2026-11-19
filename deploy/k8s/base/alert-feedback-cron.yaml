@@ -22,5 +22,9 @@ spec:
             - name: run
               image: edgevision-service
               command: ["python", "-m", "edgevision.media.alerts", "run"]
-              env: [{name: CONTROL_API, value: "http://control-api:8090"}]
+              env:
+                - {name: CONTROL_API, value: "http://control-api:8090"}
+                # 服務金鑰：身分記成 system:alert-feedback（控制 API 強制驗身分後必須帶）
+                - name: EDGEVISION_SERVICE_TOKEN
+                  valueFrom: {secretKeyRef: {name: edgevision-service-tokens, key: alert-feedback, optional: true}}
               resources: {requests: {cpu: 10m, memory: 64Mi}, limits: {memory: 256Mi}}

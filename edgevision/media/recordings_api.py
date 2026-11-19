@@ -5,6 +5,7 @@
       GET  /recordings/{cam}/days                這台有錄影的日子
       GET  /recordings/{cam}?day=                某天每一段的起訖、狀態（ok / writing / broken）、缺口
       GET  /recordings/{cam}/files/{file}        播放（Range）；?download=1 下載
+      （清單回的 stream_url / download_url / thumbnail_url 都附短效簽名，<video src> 不用帶 token；見 edgevision/api/signed_url.py）
       POST /recordings/{cam}/clips               剪一段（起訖時間＋名稱）→ 影片庫的一筆（背景任務）
     錄影名單
       GET  /recordings/roster                    所有相機：要不要錄、最近 24 小時寫了多少
@@ -30,6 +31,7 @@ from fastapi import HTTPException, Query
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
+from edgevision.api import signed_url
 from edgevision.media import recordings as R
 from edgevision.media import schemas as S
 from edgevision.media import video_thumbs as VT
@@ -142,8 +144,8 @@ def register(r, *, state: dict, lib, who, audit, call, H, new_task) -> None:
         第一次查某天要逐段開檔量長度（約幾秒），之後有快取。"""
         out = nas(R.list_day, db(), cam, day, gap_tolerance_s=gap_tolerance_s)
         for s in out["segments"]:
-            s["stream_url"] = f"/api/media/recordings/{cam}/files/{s['file']}"
-            s["download_url"] = s["stream_url"] + "?download=1"
+            s["stream_url"] = signed_url.sign_or_keep(f"/api/media/recordings/{cam}/files/{s['file']}")
+            s["download_url"] = s["stream_url"] + ("&" if "?" in s["stream_url"] else "?") + "download=1"
         return out
 
     @r.get("/recordings/{cam}/files/{file}", response_class=FileResponse,
@@ -194,8 +196,8 @@ def register(r, *, state: dict, lib, who, audit, call, H, new_task) -> None:
         x["start_s"], x["end_s"] = p.get("start_s"), p.get("end_s")
         x["actual_start"] = p.get("actual_start")
         x["name"] = x["name"] or _default_name(x)
-        x["stream_url"] = f"/api/media/videos/{x['id']}/stream"
-        x["thumbnail_url"] = f"/api/media/videos/{x['id']}/thumbnail"
+        x["stream_url"] = signed_url.sign_or_keep(f"/api/media/videos/{x['id']}/stream")
+        x["thumbnail_url"] = signed_url.sign_or_keep(f"/api/media/videos/{x['id']}/thumbnail")
         x.pop("blob_sha256", None)
         return x
 

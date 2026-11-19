@@ -18,8 +18,7 @@ spec:
           - {path: /api/models, pathType: Prefix, backend: {service: {name: control-api, port: {number: 8090}}}}
           # 圖片庫 / 標注 / 自動標注
           - {path: /api/media, pathType: Prefix, backend: {service: {name: control-api, port: {number: 8090}}}}
-          # 標注審核前端（web/review，control-api 直接給靜態檔）
-          - {path: /review, pathType: Prefix, backend: {service: {name: control-api, port: {number: 8090}}}}
+          - {path: /api/permissions, pathType: Prefix, backend: {service: {name: control-api, port: {number: 8090}}}}
           # PTZ（獨立服務；OpenAPI 在 /api/ptz/openapi.json）
           - {path: /api/ptz, pathType: Prefix, backend: {service: {name: ptz, port: {number: 8097}}}}
           # 控制 API 的 OpenAPI 規格與 /docs（推論 API 的在根目錄 /openapi.json、/docs）

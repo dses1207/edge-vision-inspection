@@ -7,8 +7,8 @@
       - FrameResult.station（一線多站的站別）：同上，DB 分不出 NG 是哪一站判的
     現在 runner（產生端）與 event-processor（消費端）用同一份程式碼。
 
-要加欄位：改 ai-infer/libs/contracts → 升版號 → 發佈到 Gitea 套件庫（ai-infer CI 自動）
-        → 這個 repo 的 requirements.txt 升 edgevision-contracts 版號。
+要加欄位：改 ai-infer/libs/contracts （同一個 repo，用路徑安裝）
+        → 兩端重建映像就會用到新版。
 """
 from edgevision_contracts.detection import *  # noqa: F401,F403
 from edgevision_contracts.detection import (  # noqa: F401

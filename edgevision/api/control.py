@@ -36,7 +36,6 @@ import time
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
 
 from libs.contracts import PromoteRequest, TrainingJobRequest
 from libs.contracts.training import TaskStatus, TaskType
@@ -119,6 +118,12 @@ async def lifespan(app: FastAPI):
     from edgevision.api import auth as _auth
     _auth.load_jwks_at_startup()
     _state.update(build_state())
+    from edgevision.api.gate import Recorder
+    _state["auth_recorder"] = Recorder(_state["db"])      # 沒帶有效身分的請求（第二期觀察用）
+    _state["auth_recorder"].start()
+    from edgevision.api.directory_sync import DirectorySync
+    _state["directory_sync"] = DirectorySync(_state["db"])  # 員工名冊（AuthServer）→ 權限人員，每小時
+    _state["directory_sync"].start()
     _state["orchestrator"].start_background()
     _state["submit_training"] = submit_training_job
     _state["start_dataset_mix"] = start_dataset_mix
@@ -131,6 +136,8 @@ async def lifespan(app: FastAPI):
     if "media_campaign" in _state:
         _state["media_campaign"].shutdown()
     _state["orchestrator"].shutdown()
+    _state["auth_recorder"].shutdown()
+    _state["directory_sync"].shutdown()
     _state["db"].close()
 
 
@@ -171,6 +178,18 @@ apply_cors(app, "控制 API")
 from edgevision.media.api import build_router as _media_router  # noqa: E402
 
 app.include_router(_media_router(_state, lambda *a: _actor(*a)))
+
+# 頁面權限（ipcam-web）：身分只認 SSO token；回應照標準回應外殼（目前只有這組端點套用）
+from edgevision.api import envelope as _envelope  # noqa: E402
+from edgevision.api.permissions import build_router as _perm_router  # noqa: E402
+
+# 身分關卡（edgevision/api/gate.py）：先掛 → 包在外殼的 traceId middleware 裡面，401 也帶 X-Trace-Id
+from edgevision.api import gate as _gate  # noqa: E402
+
+_gate.install(app, lambda: _state.get("auth_recorder"))
+_envelope.install(app, ("/api/permissions", "/api/control/auth"))
+app.include_router(_perm_router(_state))
+app.include_router(_gate.build_router(_state))
 
 
 @app.get("/openapi.json", include_in_schema=False)
@@ -643,20 +662,7 @@ def list_configs():
     return out
 
 
-# ── 測試前端 ─────────────────────────────────────────────
-_UI_DIR = Path(__file__).resolve().parents[2] / "web" / "train"
-if _UI_DIR.exists():
-    app.mount("/ui", StaticFiles(directory=str(_UI_DIR), html=True), name="ui")
-
-# 標注審核前端
-_REVIEW_DIR = Path(__file__).resolve().parents[2] / "web" / "review"
-if _REVIEW_DIR.exists():
-    app.mount("/review", StaticFiles(directory=str(_REVIEW_DIR), html=True), name="review")
-
-
-@app.get("/", include_in_schema=False)
-def root():
-    return RedirectResponse("/ui/")
+# 舊的測試前端（/ui）與標注審核前端（/review）11/18 下架：用 X-Actor 自我宣告身分，改由 ipcam-web 帶 SSO token。
 
 
 # ── 模型與部署 ───────────────────────────────────────────

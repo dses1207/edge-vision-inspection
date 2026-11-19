@@ -87,13 +87,25 @@ def _call(method: str, path: str, *, json_body: dict | None = None, params: dict
     if r.status_code >= 400:
         detail = r.text[:500]
         try:
-            detail = r.json().get("detail", detail)
+            j = r.json()
+            detail = j.get("detail") or _envelope_error(j) or detail   # 舊端點 detail；新端點標準回應外殼 error
         except Exception:
             pass
         raise ToolError(f"控制 API 回 {r.status_code}：{detail}")
 
     ct = r.headers.get("content-type", "")
     return r.json() if ct.startswith("application/json") else r.text
+
+
+def _envelope_error(j: dict) -> str:
+    """標準回應外殼的錯誤：message ＋ 驗證明細（agent 才知道哪個欄位錯）。"""
+    e = j.get("error") if isinstance(j, dict) else None
+    if not isinstance(e, dict):
+        return ""
+    msg = f"{e.get('code', '')}: {e.get('message', '')}"
+    if e.get("details"):
+        msg += " " + "; ".join(f"{d.get('field')} {d.get('code')} {d.get('message')}" for d in e["details"])
+    return msg
 
 
 def _safe(fn):

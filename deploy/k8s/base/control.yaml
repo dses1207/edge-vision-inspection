@@ -61,6 +61,11 @@ spec:
             - {name: work, mountPath: /work}
             - {name: sites, mountPath: /etc/edgevision/sites, readOnly: true}   # 推論站點：promote 時同步到其他節點的 Triton
             - {name: runner-image, mountPath: /etc/edgevision/runner, readOnly: true}   # 影片測試用線上同一個 runner 映像
+            # 服務金鑰（一個檔 = 一個服務）：身分關卡認 X-Service-Token（edgevision/api/auth.py、gate.py）
+            - {name: service-tokens, mountPath: /etc/edgevision/service-tokens, readOnly: true}
+            - {name: url-signing, mountPath: /etc/edgevision/url-signing, readOnly: true}
+            # 員工名冊 API 的 client_credentials（edgevision/api/directory_sync.py）
+            - {name: directory-client, mountPath: /etc/edgevision/directory-client, readOnly: true}
           readinessProbe: {httpGet: {path: /healthz, port: 8090}, periodSeconds: 15}
           livenessProbe: {tcpSocket: {port: 8090}, initialDelaySeconds: 30, periodSeconds: 20}
           resources: {requests: {cpu: 100m, memory: 256Mi}}
@@ -70,6 +75,12 @@ spec:
         - {name: sites, configMap: {name: edgevision-inference-sites}}
         # 不在 kustomize 裡（見 runner-reconciler.yaml）；optional：還沒建時 control-api 照樣起得來
         - {name: runner-image, configMap: {name: edgevision-runner, optional: true}}
+        # 部署時產生（deploy/ci/deploy_test.sh ensure_service_tokens），不進 git；optional：還沒建時照樣起得來
+        - {name: service-tokens, secret: {secretName: edgevision-service-tokens, optional: true}}
+        # <video src> 這類網址的簽名金鑰（edgevision/api/signed_url.py）；同樣由 deploy_test.sh 產生、不進 git
+        - {name: url-signing, secret: {secretName: edgevision-url-signing, optional: true}}
+        # scripts/register_directory_client.sh 在 AuthServer 註冊後建立（client_id、client_secret），不進 git；沒建 → 不同步
+        - {name: directory-client, secret: {secretName: edgevision-directory-client, optional: true}}
 ---
 apiVersion: v1
 kind: Service

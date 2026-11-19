@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import time
@@ -60,6 +61,57 @@ def allow_header_actor() -> bool:
     正式收緊時設成 false，沒有 token 就一律拒絕。
     """
     return os.environ.get("AUTH_ALLOW_HEADER_ACTOR", "true").lower() in ("1", "true", "yes")
+
+
+def enforcing() -> bool:
+    """強制模式：沒有有效的 token / 服務金鑰一律 401（第二期最後一步才切）。"""
+    return enabled() and not allow_header_actor()
+
+
+# ── 服務身分（叢集內排程、服務對服務）─────────────────────────
+# 一個服務一把金鑰：K8s Secret edgevision-service-tokens（部署時產生，不進 git），
+# 控制 API 把整個 Secret 掛成目錄（一個檔 = 一個服務），呼叫端只拿到自己那把（env EDGEVISION_SERVICE_TOKEN），
+# 呼叫時帶 header X-Service-Token。身分記成 system:<服務名>。
+SERVICE_TOKEN_DIR = os.environ.get("AUTH_SERVICE_TOKEN_DIR", "/etc/edgevision/service-tokens")
+_svc_cache: tuple[float, dict[str, str]] = (0.0, {})
+# 這次請求帶的服務金鑰：gate middleware 放進來，resolve() 讀（不用改每個端點的參數）
+service_token_var: "contextvars.ContextVar[str]" = contextvars.ContextVar("service_token", default="")
+
+
+def service_tokens() -> dict[str, str]:
+    """{服務名: 金鑰}，60 秒重讀一次（Secret 更新後 kubelet 會換掉掛載的檔案）。"""
+    global _svc_cache
+    at, cached = _svc_cache
+    if time.time() - at < 60:
+        return cached
+    out: dict[str, str] = {}
+    try:
+        for name in os.listdir(SERVICE_TOKEN_DIR):
+            path = os.path.join(SERVICE_TOKEN_DIR, name)
+            if name.startswith(".") or not os.path.isfile(path):
+                continue                                   # 掛載目錄裡有 ..data 等符號連結
+            with open(path, encoding="utf-8") as f:
+                tok = f.read().strip()
+            if len(tok) >= 32:
+                out[name] = tok
+    except FileNotFoundError:
+        pass
+    _svc_cache = (time.time(), out)
+    return out
+
+
+def verify_service_token(token: str) -> str | None:
+    """金鑰對得上回服務名，否則 None。逐一 constant-time 比對。"""
+    import hmac
+
+    token = (token or "").strip()
+    if not token:
+        return None
+    hit = None
+    for name, tok in service_tokens().items():
+        if hmac.compare_digest(token.encode(), tok.encode()):
+            hit = name
+    return hit
 
 
 def server_base() -> str:
@@ -200,6 +252,10 @@ def verify_token(token: str) -> Identity:
     )
 
 
+# cron：舊的告警回流排程送這個值（以前會被擋成 400）；system：服務金鑰呼叫
+CHANNELS = ("ui", "mcp", "api", "system", "cron")
+
+
 def resolve(
     authorization: str | None, x_actor: str | None, x_actor_type: str | None, x_channel: str | None,
 ) -> tuple[Identity, str]:
@@ -211,8 +267,15 @@ def resolve(
         ③ 都沒有         → AUTH_ENABLED 時拒絕；否則 anonymous
     """
     channel = (x_channel or "api").lower()
-    if channel not in ("ui", "mcp", "api"):
-        raise ValueError("X-Channel 必須是 ui | mcp | api")
+    if channel not in CHANNELS:
+        raise ValueError("X-Channel 必須是 " + " | ".join(CHANNELS))
+
+    svc = service_token_var.get()
+    if svc:
+        name = verify_service_token(svc)
+        if not name:
+            raise ValueError("服務金鑰無效")
+        return Identity(actor=f"system:{name}", actor_type="system"), "system"
 
     token = ""
     if authorization and authorization.lower().startswith("bearer "):

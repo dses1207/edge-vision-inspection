@@ -23,6 +23,29 @@ if [ -z "${TRAIN_TAG:-}" ]; then
 fi
 echo "edgevision-service:$SHA  edgevision-train:$TRAIN_TAG"
 bash deploy/ci/migrate_db.sh            # 資料庫結構先補上，再換服務映像
+
+# 服務金鑰（控制 API 身分關卡認 X-Service-Token）：缺哪把補哪把，已有的不換（換了要重啟所有呼叫端）。
+# 金鑰只經 stdin 給 kubectl，不印、不進命令列參數、不進 git。要輪替：刪掉 Secret 再部署一次。
+ensure_service_tokens() {
+  local have
+  have=$(kubectl -n $NS get secret edgevision-service-tokens -o jsonpath='{.data}' 2>/dev/null || true)
+  kubectl -n $NS get secret edgevision-service-tokens >/dev/null 2>&1 \
+    || kubectl -n $NS create secret generic edgevision-service-tokens >/dev/null
+  for svc in alert-feedback output-api; do
+    if ! grep -q "\"$svc\"" <<<"$have"; then
+      printf '{"stringData":{"%s":"%s"}}' "$svc" "$(openssl rand -hex 32)" \
+        | kubectl -n $NS patch secret edgevision-service-tokens --type merge --patch-file /dev/stdin >/dev/null
+      echo "服務金鑰：新增 $svc"
+    fi
+  done
+  # 網址簽名金鑰（<video src> 用）：分開放，否則會被當成一把服務金鑰
+  kubectl -n $NS get secret edgevision-url-signing >/dev/null 2>&1 || {
+    printf '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"edgevision-url-signing"},"stringData":{"key":"%s"}}' \
+      "$(openssl rand -hex 32)" | kubectl -n $NS create -f - >/dev/null
+    echo "網址簽名金鑰：新增"
+  }
+}
+ensure_service_tokens
 EDGEVISION_TAG=$SHA TRAIN_TAG=$TRAIN_TAG bash deploy/k8s/apply.sh "${OVERLAY:-example}"
 
 # runner：不在這裡產生 —— 叢集上的 runner-reconciler 每 30 秒照線路表自己建 / 收 / 換。

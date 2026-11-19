@@ -40,6 +40,93 @@ def _clean(d: dict) -> dict:
 
 def register(mcp, call: Callable, safe: Callable, RO, WRITE, DESTRUCTIVE, actor: Callable[[], str]) -> None:
 
+    # ── 頁面權限（ipcam-web；只認 SSO token，標準回應外殼）──────────
+
+    @mcp.tool(title="頁面權限總表", annotations=RO)
+    @safe
+    def get_permissions() -> dict:
+        """ipcam-web 的頁面權限整包：enforce 開關、人員與角色、單位權限、個人例外、訪客範本、version。
+        判斷順序：admin 全 edit → 個人例外 → 單位（guest 除外）→ 訪客範本；沒列的頁算 none。"""
+        return call("GET", "/api/permissions")
+
+    @mcp.tool(title="我的權限身分", annotations=RO)
+    @safe
+    def get_my_permission_identity() -> dict:
+        """後端從目前登入者的 token 讀到的帳號、姓名、單位（含來自哪個 claim）與角色。不回 token。"""
+        return call("GET", "/api/permissions/me")
+
+    @mcp.tool(title="整包更新頁面權限", annotations=DESTRUCTIVE)
+    @safe
+    def update_permissions(version: int, enforce: bool, reason: str, people: list[dict] | None = None,
+                           units: dict | None = None, overrides: dict | None = None,
+                           guest: dict | None = None) -> dict:
+        """⚠️ 整包替換頁面權限（等同權限管理頁按「儲存」）。先用 get_permissions 讀，改完整包送回。
+        只有在 /system/permissions 是 edit 的人能存；存完至少要剩一位 admin、自己也要還能改權限。
+
+        Args:
+            version: get_permissions 讀到的 version；別人先存過會回 409，要重讀
+            enforce: 權限控管開關
+            reason: 為什麼改（必填，進異動紀錄）
+            people: [{account, role}]，只吃 role（admin/user/guest）；沒列的人不變
+            units: {單位: {頁面: view|edit}}，整包替換；單位有設定但一頁都沒開給 {}
+            overrides: {帳號: {頁面: none|view|edit}}，整包替換
+            guest: {頁面: view|edit}，整包替換
+        """
+        if not reason.strip():
+            raise ValueError("reason 必填")
+        return call("PUT", "/api/permissions", json_body={
+            "version": version, "enforce": enforce, "reason": reason, "people": people or [],
+            "units": units or {}, "overrides": overrides or {}, "guest": guest or {}})
+
+    @mcp.tool(title="搜尋權限人員", annotations=RO)
+    @safe
+    def search_permission_people(q: str = "", unit: str = "", enabled: bool | None = None,
+                                 page: int = 1, page_size: int = 20) -> dict:
+        """所有人（員工名冊同步＋登入過的人）：帳號、姓名、單位、角色、在職。get_permissions 只回有被管到的人，
+        要幫還沒登入過的人設角色就先從這裡找到帳號，再用 update_permissions 的 people 設。
+
+        Args:
+            q: 帳號、姓名或工號（部分符合）
+            unit: 單位代碼（完全符合，例如 U100）
+            enabled: true 只看在職、false 只看停用
+            page_size: 每頁筆數，上限 100
+        """
+        params = {"q": q, "unit": unit, "page": page, "pageSize": page_size}
+        if enabled is not None:
+            params["enabled"] = str(enabled).lower()
+        return call("GET", "/api/permissions/people", params=params)
+
+    @mcp.tool(title="員工名冊同步狀態", annotations=RO)
+    @safe
+    def get_directory_sync_status() -> dict:
+        """員工名冊（AuthServer，AD＋HR）→ 權限人員的同步狀態：上次成功時間、最近一次結果
+        （not_configured = 還沒設定名冊 API 憑證；failed 會附原因）。每小時自動同步一次。"""
+        return call("GET", "/api/permissions/directory")
+
+    @mcp.tool(title="立刻同步員工名冊", annotations=WRITE)
+    @safe
+    def run_directory_sync(full: bool = False) -> dict:
+        """立刻從員工名冊同步一次（只更新姓名、單位、email、在職；角色不動）。要有權限管理頁的 edit。
+
+        Args:
+            full: true = 整份重抓；預設只抓上次之後有變動的
+        """
+        return call("POST", "/api/permissions/directory/sync", params={"full": str(full).lower()})
+
+    @mcp.tool(title="未驗證的 API 呼叫", annotations=RO)
+    @safe
+    def list_unverified_api_calls(days: int = 7, page: int = 1, page_size: int = 20) -> dict:
+        """控制 API 身分關卡記到的「沒帶有效 SSO token / 服務金鑰」的請求，按天彙整、次數多的在前。
+        欄位：路由、X-Actor（自我宣告，只當線索）、管道、原因（no_token / bad_token / bad_service_token / bad_signature）、
+        User-Agent、來源 IP、次數。切強制模式前用它找還在用 X-Actor 的呼叫者。
+
+        Args:
+            days: 看最近幾天（1～90）
+            page_size: 每頁筆數，上限 100
+        """
+        return call("GET", "/api/control/auth/unverified",
+                    params={"days": days, "page": page, "pageSize": page_size})
+
     # ── 模型 ─────────────────────────────────────────────
 
     @mcp.tool(title="模型版本改名", annotations=DESTRUCTIVE)

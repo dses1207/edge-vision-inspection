@@ -46,7 +46,7 @@ in_container() {  # image [docker args...] -- cmd...
         -e MINIO_ENDPOINT=minio:9000 -e TRITON_URL=http://triton:8000 \
         -e DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}" \
         -e CLEARML_API_HOST=http://clearml-apiserver:8008 -e LAKEFS_ENDPOINT=http://lakefs:8000 \
-        -e CONTROL_URL=http://control-api:8090 -e CLEARML_PROJECT=edgevision-itest \
+        -e CONTROL_URL=http://control-api:8090 -e CLEARML_PROJECT=edgevision-itest -e EDGEVISION_TOKEN -e EDGEVISION_SERVICE_TOKEN \
         -w /app "${dargs[@]}" "$img" "$@"
 }
 
@@ -88,7 +88,13 @@ run_integration() {
 }
 
 # ── 端到端 ────────────────────────────────────────────────
-api() { curl -sf -m 30 -H 'Content-Type: application/json' -H 'X-Actor: test_train.sh' -H 'X-Channel: api' "$@"; }
+# 身分：EDGEVISION_TOKEN（SSO token）或 EDGEVISION_SERVICE_TOKEN（服務金鑰）；都沒有才退回 X-Actor（強制模式會 401）
+auth_hdr() {
+    if [ -n "${EDGEVISION_TOKEN:-}" ]; then printf 'Authorization: Bearer %s' "$EDGEVISION_TOKEN"
+    elif [ -n "${EDGEVISION_SERVICE_TOKEN:-}" ]; then printf 'X-Service-Token: %s' "$EDGEVISION_SERVICE_TOKEN"
+    else printf 'X-Actor: test_train.sh'; fi
+}
+api() { curl -sf -m 30 -H 'Content-Type: application/json' -H "$(auth_hdr)" -H 'X-Channel: api' "$@"; }
 jq_(){ python3 -c "import sys,json
 v=json.load(sys.stdin)
 for k in sys.argv[1].split('.'): v=v[k]

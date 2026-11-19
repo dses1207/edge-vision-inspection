@@ -39,13 +39,19 @@ def fetch_registry(name: str, *, base: str | None = None, timeout: float = 5.0):
     """模型 production 版的 {version, task, imgsz, classes}；不在 Registry / 沒有 production → None；連不上 → UNREACHABLE。"""
     base = (base or os.environ.get("CONTROL_URL", "http://control-api:8090")).rstrip("/")
     q = urllib.parse.quote(name, safe="")
+    # 服務金鑰（Secret edgevision-service-tokens 的 output-api）：控制 API 強制驗身分後，沒帶就會 401
+    hdr = {"X-Service-Token": os.environ["EDGEVISION_SERVICE_TOKEN"]} if os.environ.get("EDGEVISION_SERVICE_TOKEN") else {}
+
+    def get(url):
+        return urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=timeout)
+
     try:
-        with urllib.request.urlopen(f"{base}/api/models/{q}/versions", timeout=timeout) as r:
+        with get(f"{base}/api/models/{q}/versions") as r:
             versions = json.load(r)
         prod = [v["version"] for v in versions if "production" in (v.get("tags") or [])]
         if not prod:
             return None
-        with urllib.request.urlopen(f"{base}/api/models/{q}/versions/{max(prod)}", timeout=timeout) as r:
+        with get(f"{base}/api/models/{q}/versions/{max(prod)}") as r:
             d = json.load(r)
         if not d.get("class_names") or not d.get("imgsz"):
             logger.warning("Registry 的 %s v%s 缺 class_names / imgsz", name, d.get("version"))

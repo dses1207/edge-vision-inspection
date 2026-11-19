@@ -16,7 +16,16 @@ def api():
         pytest.skip(f"control-api 未就緒（{API}）")
     if r.status_code != 200:
         pytest.skip(f"control-api 不健康：{r.text}")
-    return httpx.Client(base_url=API, timeout=15, headers={"X-Actor": "itest", "X-Channel": "api"})
+    return httpx.Client(base_url=API, timeout=15, headers={**_auth(), "X-Channel": "api"})
+
+
+def _auth() -> dict:
+    """EDGEVISION_TOKEN（SSO token）或 EDGEVISION_SERVICE_TOKEN（服務金鑰）；都沒有才退回 X-Actor（強制模式會 401）。"""
+    if os.environ.get("EDGEVISION_TOKEN"):
+        return {"Authorization": f"Bearer {os.environ['EDGEVISION_TOKEN']}"}
+    if os.environ.get("EDGEVISION_SERVICE_TOKEN"):
+        return {"X-Service-Token": os.environ["EDGEVISION_SERVICE_TOKEN"]}
+    return {"X-Actor": "itest"}
 
 
 def test_health(api):
@@ -30,7 +39,7 @@ def test_invalid_job_rejected(api):
 
 
 def test_bad_channel_rejected(api):
-    r = api.post("/api/training/jobs", json={"model_name": "seg_alpha", "dataset_ref": "x"}, headers={"X-Channel": "cron"})
+    r = api.post("/api/training/jobs", json={"model_name": "seg_alpha", "dataset_ref": "x"}, headers={"X-Channel": "webhook"})
     assert r.status_code == 400
 
 
